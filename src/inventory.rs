@@ -54,8 +54,10 @@ pub(crate) fn observe<'a>(
         "invalid inventory source name"
     );
     let path = ledger_path(root, source);
-    if path.is_symlink() || path.parent().is_some_and(|parent| parent.is_symlink()) {
-        bail!("inventory ledger path must not be a symlink");
+    for parent in path.ancestors() {
+        if parent.is_symlink() {
+            bail!("inventory ledger path must not contain a symlink");
+        }
     }
     let mut known = if path.exists() {
         let old: Ledger = serde_json::from_slice(&fs::read(&path)?)
@@ -77,7 +79,7 @@ pub(crate) fn observe<'a>(
     let absent = known.difference(&current).count() as u64;
     let new = current.difference(&known).count() as u64;
     if persist && new > 0 {
-        known.extend(current);
+        known.extend(current.iter().cloned());
         let folder = path.parent().context("missing inventory directory")?;
         fs::create_dir_all(folder)?;
         ensure!(!folder.is_symlink(), "inventory directory is a symlink");
