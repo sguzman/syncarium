@@ -88,3 +88,9 @@ The experimental `google_drive_ids` adapter calls Google's file content GET endp
 ### Provider completeness signaling
 
 For the native Google immutable-ID source, listing returns both eligible byte-range items and an explicit unresolved count. The scheduler makes progress on eligible items while reporting a nonzero incomplete-run status when unsupported Google Docs, unknown sizes or missing provider checksums make full ID recovery impossible. The read-only audit exposes the count independently. This is not equivalent to end-to-end completeness: inaccessible or never-listed items remain outside the provider inventory.
+
+## Authentication boundary (deliberately outside Syncarium)
+
+The scheduler must not manage Google OAuth registration or user-consent workflows. It receives read-only authorization through previously configured external remotes or an explicitly supplied, owner-private local access-token file. **No custom OAuth login, token exchange, refresh-token persistence, automatic renewal, or unattended reauthentication is planned.** If an external backend can refresh its *own* token, that behavior belongs to the backend, and Syncarium must still handle its failure.
+
+The native Google ID adapter's short-lived bearer token is a **manual-session credential**, not viable persistent unattended authentication by itself. Keep the adapter disabled under the recurring timer until separate local authorization handling and live transfer behavior are validated. Authentication errors must preserve staged bytes, be actionable, and never block other healthy sources from making progress.

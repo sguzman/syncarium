@@ -51,7 +51,7 @@ Put manifests with signed/private URLs in `~/.config/syncarium/` with `chmod 600
 - `list_items`: returns a provider object ID, relative destination path, exact size, provider version and optional checksums.
 - `read_range`: reads a bounded byte range and provides response metadata suitable for version pinning.
 - `capabilities`: declares whether ranges, checksums and immutable identifiers actually work.
-- `authenticate`: provider-specific flow, using OS-protected credential storage, never a public TOML file.
+- `credentials`: consume an already-authorized, operator-configured provider connection or owner-private short-lived token file. **No custom OAuth, login browser flow, or automatic token renewal in Syncarium.**
 
 This interface is currently conceptual; the implementation uses one Rust enum to dispatch adapters. Future backend refactors must maintain current checkpoint safety semantics.
 
@@ -78,3 +78,7 @@ For the native Google ID adapter, use a distinct destination such as `/drive/gdr
 The native ID adapter counts every planned collision candidate it cannot download under its conservative contract: unsupported types (including shortcuts), unknown-size exports, and binary files missing a valid MD5. `audit --json` reports `unresolved_provider_items`; `run` continues eligible bytes inside its budget but returns nonzero for incomplete source coverage. No attempt is made to fabricate file sizes or infer an absent hash.
 
 Google object IDs are deliberately omitted from serialized recovery plans and local destination names. The native Rust HTTP adapter also strips underlying HTTP error details that could include immutable Drive IDs or signed request information from logs. File integrity is validated against Google-provided MD5 before publication, but this is not a cryptographic proof against malicious provider responses.
+
+## Credential policy
+
+Google OAuth registration, consent screens, refresh tokens, callback servers, and automatic renewal are **out of scope by design**. For ordinary Google Drive use the existing authorized `gdrive:` rclone connection; rclone may manage its own token state. If authorization ceases to work, manual intervention is expected. For the experimental native Google ID adapter, `token_file` holds a **short-lived, manually supplied token**. This adapter must stay disabled in unattended schedules while manually renewed access tokens are the only available authorization mechanism. Credentials must never appear in a checked-in TOML file.

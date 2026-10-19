@@ -77,3 +77,14 @@ Use `syncarium --config ~/.config/syncarium/config.toml drive-collisions --remot
 ## Native Google ID coverage gaps
 
 The opt-in `google_drive_ids` adapter only downloads candidate objects with an exact source size **and** valid Google provider MD5. Unsupported shortcuts, Google Workspace exports, and files without verification metadata are counted as `unresolved_provider_items` by `audit --json`. When using `plan` or `run --execute`, unresolved items produce a `SOURCE INCOMPLETE` warning and a **nonzero** overall exit status, even if eligible files make progress. This prevents silently declaring a partially supported Google archive complete. Resolve these objects with a future dedicated exporter; do not delete the legacy downloader yet.
+
+## Manual Google authentication / expired credentials
+
+Authentication is explicitly an **operator task**, not an automation feature planned for Syncarium.
+
+- Existing `gdrive:`: keep using the locally configured rclone remote; when its authorization fails, reauthorize it manually through rclone's supported interactive flow, then retry a bounded run.
+- Experimental `google_drive_ids`: the private `token_file` contains a **short-lived Google access token**, which may expire before an hourly unattended run. If rejected, renew it manually through an authorized local method or simply leave this adapter disabled. Do not attempt to paste tokens into chat, commits, bug reports, or shell history.
+- Do **not** create a new Google OAuth client, callback server, or token-refresh daemon just to use this project. Syncarium does not automatically obtain or renew credentials.
+- A failed authentication must not reset or delete archives/checkpoints. Other healthy sources may still download, and the failing run returns a nonzero status for monitoring.
+
+This manual boundary is intentional. There is no automatic Google OAuth renewal milestone on the roadmap.
