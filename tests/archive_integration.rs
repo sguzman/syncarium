@@ -69,6 +69,14 @@ destination = "{}"
         }
     }
     assert_eq!(fs::read(dest.join("large.bin")).unwrap(), payload);
+    let audit = Command::new(executable)
+        .arg("--config").arg(&config_path).args(["audit", "--json"])
+        .output().unwrap();
+    assert!(audit.status.success(), "audit: {}", String::from_utf8_lossy(&audit.stderr));
+    let coverage: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(coverage["sources"][0]["listed_files"], 1);
+    assert_eq!(coverage["sources"][0]["present_size_matched"], 1);
+    assert_eq!(coverage["sources"][0]["missing_files"], 0);
     let status = Command::new(executable)
         .arg("--config").arg(&config_path).args(["status", "--json"])
         .output().unwrap();

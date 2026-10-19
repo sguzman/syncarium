@@ -56,3 +56,7 @@ A failure can leave an orphaned partial if it occurs at an unlucky step. Fail cl
 ## Long-term backend roadmap
 
 Native Rust HTTP is implemented. Apache OpenDAL has a Rust Google Drive service, but authentication and duplicate-file IDs must be handled correctly before declaring feature equivalence. An older OpenDAL iCloud Drive backend is not proof of current iCloud Photos support. Use a separately-tested native adapter when its completeness and security match or exceed the bridge.
+
+## Read-only coverage audit
+
+The `audit` subcommand inventories every enabled source and compares path and file **size** without transferring payload. It reports present-size-matched, local conflicts, staged, missing, and inaccessible/held items separately. Counts reflect only what the source adapter lists, which can be incomplete (especially Apple Photos). Matching size is **not** proof of matching bytes or successful original-quality export. Results can be obtained as structured JSON for future UIs; the audit never deletes or repairs content.

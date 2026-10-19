@@ -32,6 +32,12 @@ enum Action {
     Plan,
     /// Default is preview; --execute is required to download.
     Run { #[arg(long)] execute: bool },
+    /// Audit source-to-local coverage (metadata listing; no file payload downloads).
+    Audit {
+        /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect durable staged progress locally (no cloud calls).
     Status {
         /// Emit machine-readable JSON instead of text.
@@ -120,6 +126,30 @@ struct StatusReport {
     committed_bytes: u64,
     sources: Vec<SourceProgress>,
 }
+
+#[derive(Serialize, Default)]
+struct AuditSource {
+    name: String,
+    // Source listing is only as complete as the provider API.
+    listed_files: u64,
+    listed_bytes: u64,
+    present_size_matched: u64,
+    present_size_mismatch: u64,
+    missing_files: u64,
+    missing_bytes: u64,
+    staged_files: u64,
+    staged_saved_bytes: u64,
+    staged_remaining_bytes: u64,
+    held_files: u64,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AuditReport {
+    archive_root: String,
+    sources: Vec<AuditSource>,
+    warning: &'static str,
+}
 struct Pending {
     source: Source,
     files: Vec<Item>,
@@ -142,8 +172,109 @@ fn main() -> Result<()> {
             println!("No cloud connections or downloads attempted.");
         }
         Action::Status { json } => status(&cfg, json)?,
+        Action::Audit { json } => audit(&cfg, json)?,
         Action::Plan => transfer_pass(&cfg, false)?,
         Action::Run { execute } => transfer_pass(&cfg, execute)?,
+    }
+    Ok(())
+}
+
+/// Audit current remote listings against local files without downloading payloads.
+/// Never call this a full integrity check: provider inventories can be incomplete.
+fn audit(cfg: &Config, json: bool) -> Result<()> {
+    check_mount(cfg)?;
+    let mut report = AuditReport {
+        archive_root: cfg.archive_root.display().to_string(),
+        sources: Vec::new(),
+        warning: "Counts reflect only items returned by the provider API; present files are compared by size, not content hash. This is not proof of a complete archive.",
+    };
+    let mut errors = 0u64;
+    for source in cfg.sources.iter().filter(|src| src.enabled) {
+        ensure!(
+            source.destination.is_dir(),
+            "{} archive destination missing: {}",
+            source.name,
+            source.destination.display()
+        );
+        no_symlink_ancestors(&source.destination)?;
+        let mut row = AuditSource {
+            name: source.name.clone(),
+            ..AuditSource::default()
+        };
+        match read_items(source) {
+            Err(error) => {
+                row.error = Some(format!("{error:#}"));
+                errors += 1;
+            }
+            Ok(items) => {
+                for item in items {
+                    row.listed_files += 1;
+                    row.listed_bytes = row.listed_bytes.saturating_add(item.size);
+                    let target = source.destination.join(safe_relative(&item.path)?);
+                    no_symlink_ancestors(&target)?;
+                    match fs::symlink_metadata(&target) {
+                        Ok(metadata) => {
+                            if metadata.is_file() && metadata.len() == item.size {
+                                row.present_size_matched += 1;
+                            } else {
+                                // The archive is append-only; never repair or replace
+                                // a conflicting local path without explicit intervention.
+                                row.present_size_mismatch += 1;
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            match checkpoint(&cfg.archive_root, &source.name, &item, false) {
+                                Ok((cp, part, _)) if part.exists() => {
+                                    row.staged_files += 1;
+                                    row.staged_saved_bytes = row
+                                        .staged_saved_bytes.saturating_add(cp.committed);
+                                    row.staged_remaining_bytes = row
+                                        .staged_remaining_bytes.saturating_add(item.size - cp.committed);
+                                }
+                                Ok(_) => {
+                                    row.missing_files += 1;
+                                    row.missing_bytes = row.missing_bytes.saturating_add(item.size);
+                                }
+                                Err(_) => {
+                                    row.held_files += 1;
+                                }
+                            }
+                        }
+                        Err(error) => return Err(error).context("inspecting local archive"),
+                    }
+                }
+                if row.present_size_mismatch > 0 || row.held_files > 0 {
+                    errors += 1;
+                }
+            }
+        }
+        report.sources.push(row);
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Syncarium archive coverage audit");
+        for row in &report.sources {
+            if let Some(error) = &row.error {
+                println!("{}: listing FAILED: {}", row.name, error);
+            } else {
+                println!(
+                    "{}: {} listed, {} size-matched local, {} staged, {} missing, {} mismatched, {} held",
+                    row.name, row.listed_files, row.present_size_matched,
+                    row.staged_files, row.missing_files,
+                    row.present_size_mismatch, row.held_files
+                );
+                println!(
+                    "  Pending: {} MiB wholly missing, {} MiB remaining in partials",
+                    row.missing_bytes / 1_048_576,
+                    row.staged_remaining_bytes / 1_048_576
+                );
+            }
+        }
+        println!("WARNING: {}", report.warning);
+    }
+    if errors > 0 {
+        bail!("{errors} source(s) have audit errors/conflicts; see report above");
     }
     Ok(())
 }
