@@ -323,3 +323,55 @@ destination = "{}"
     assert_eq!(counts["sources"][0]["mismatched"], 1);
     assert_eq!(fs::read(dest.join("file.bin")).unwrap(), b"changed-content");
 }
+
+
+#[test]
+fn workspace_export_plan_is_private_read_only_and_reports_unsupported_types() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("archive");
+    let dest = root.join("drive");
+    fs::create_dir_all(&dest).unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "google-drive"
+kind = "rclone"
+enabled = false
+remote = "unused:"
+destination = "{}"
+"#, root.display(), dest.display()
+    )).unwrap();
+    let fixture = tmp.path().join("private-google-objects.json");
+    fs::write(&fixture, serde_json::to_vec(&serde_json::json!([
+        {"id":"private-id-document", "name":"private-tax-return", "mimeType":"application/vnd.google-apps.document"},
+        {"id":"private-id-sheet", "name":"private-budget", "mimeType":"application/vnd.google-apps.spreadsheet"},
+        {"id":"private-id-forms", "name":"survey", "mimeType":"application/vnd.google-apps.form"}
+    ])).unwrap()).unwrap();
+    let command = || Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config)
+        .args(["drive-workspace-plan", "--source", "google-drive", "--fixture"])
+        .arg(&fixture).arg("--json").output().unwrap();
+    let first = command();
+    assert!(!first.status.success(), "unexportable types cannot be silently treated as complete");
+    let parsed: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(parsed["supported"].as_array().unwrap().len(), 2);
+    assert_eq!(parsed["unsupported_google_types"], 1);
+    assert_eq!(parsed["supported"][0]["size_known_before_export"], false);
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(!stdout.contains("private-id-document"));
+    assert!(!stdout.contains("private-tax-return"));
+    assert!(!stdout.contains("private-budget"));
+    assert!(parsed["supported"].as_array().unwrap().iter().all(|item|
+        item["relative_destination"].as_str().unwrap().starts_with("workspace-exports/")));
+    assert!(!dest.join("workspace-exports").exists(),
+        "read-only plan must not create archive directories");
+    assert_eq!(first.stdout, command().stdout, "planning must be deterministic");
+}
