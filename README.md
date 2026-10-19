@@ -95,3 +95,5 @@ Other already-authorized sources can continue within the same bandwidth budget. 
 - **Optional inventory sanity floors:** per-source `min_items` rejects implausibly short listings, useful when a provider temporarily omits thousands of photos. Thresholds are configured manually in private TOML after establishing a baseline.
 
 - **Local SHA-256 receipts:** each newly published file has an immutable receipt recording exactly which local bytes were assembled. `syncarium verify [--source NAME] [--json]` rehashes those files without contacting cloud accounts; preexisting files without receipts are explicitly outside this verification.
+
+- **Interrupted publication reconciliation:** a restarted executing pass can clean stale staging links from an already completed file only after confirming same-file inode identity, completed checkpoint, and matching receipt. Different-file conflicts are preserved.

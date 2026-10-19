@@ -106,3 +106,7 @@ After inspecting a known-good source listing, optionally set `min_items` on that
 ## Verify published local archive receipts (no cloud access)
 
 Run `syncarium --config ~/.config/syncarium/config.toml verify` to read and SHA-256 check all previously receipted Syncarium downloads, or add `--source icloud-photos` to check one configured source. Use `--json` for aggregate machine-readable counts. The command reads full local files (potentially **many gigabytes**), so run it deliberately when disk activity is acceptable, not after every hourly pass. It never downloads, uploads, deletes or repairs anything. A nonzero exit indicates missing, mismatched or invalid receipts. Legacy files that predate this receipt feature remain **unverified** until an explicit future provenance migration; they are not automatically certified based on matching names or sizes.
+
+## Interrupted completion cleanup
+
+After a reboot, a file may already be present at the final destination while its full staged partial and JSON checkpoint remain. The next **executing** Syncarium pass can safely reconcile this only when the staged partial and final archive path are actually hard links to the **same inode**, the saved checkpoint is complete and valid, and provider checksum checks pass. It logs `RECOVERED interrupted publication`. If a different file occupies the destination, Syncarium preserves both and reports the unresolved staging state instead of overwriting or deleting either. `run` without `--execute` never performs cleanup.
