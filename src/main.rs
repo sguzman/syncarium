@@ -906,6 +906,30 @@ fn store_chunk(part: &Path, meta: &Path, cp: &mut Checkpoint, chunk: &Path) -> R
     cp.last_sha256 = hex::encode(Sha256::digest(&content));
     atomic_json(meta, cp)
 }
+/// A matching path is not automatically a valid archived copy. Fail closed
+/// on directories, symbolic links, and obvious size mismatches, without ever
+/// modifying whatever is already present at that path.
+fn destination_already_archived(target: &Path, item: &Item) -> Result<bool> {
+    no_symlink_ancestors(target)?;
+    match fs::symlink_metadata(target) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_file(),
+                "local archive conflict: existing path is not a regular file: {}",
+                target.display()
+            );
+            ensure!(
+                metadata.len() == item.size,
+                "local archive conflict: {} has {} bytes, but current source advertises {} bytes; no overwrite attempted",
+                target.display(), metadata.len(), item.size
+            );
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("inspecting existing archive path"),
+    }
+}
+
 fn publish(part: &Path, meta: &Path, destination: &Path, item: &Item) -> Result<()> {
     let target = destination.join(safe_relative(&item.path)?);
     no_symlink_ancestors(&target)?;
@@ -977,8 +1001,7 @@ fn advance_source(
     let item = &pending.files[pending.index];
     let relative = safe_relative(&item.path)?;
     let target = pending.source.destination.join(relative);
-    no_symlink_ancestors(&target)?;
-    if target.exists() {
+    if destination_already_archived(&target, item)? {
         pending.index += 1;
         return Ok(true);
     }
@@ -1120,9 +1143,18 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
         let mut files = Vec::new();
         for item in items {
             let target = source.destination.join(safe_relative(&item.path)?);
-            no_symlink_ancestors(&target)?;
-            if target.exists() {
-                continue;
+            match destination_already_archived(&target, &item) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    let message = format!(
+                        "{}: existing archived path held for {}: {error:#}",
+                        source.name, item.path
+                    );
+                    eprintln!("ITEM HELD: {message}");
+                    issues.push(message);
+                    continue;
+                }
             }
             match checkpoint(&cfg.archive_root, &source.name, &item, false) {
                 Ok((cp, _, _)) => files.push((cp.committed == 0, item)),
@@ -1359,6 +1391,31 @@ mod tests {
         publish(&part, &meta, &destination, &item).unwrap();
         assert_eq!(std::fs::read(destination.join(&item.path)).unwrap(), b"correct-data");
         assert!(!part.exists());
+    }
+
+    #[test]
+    fn preexisting_archive_conflicts_fail_closed_and_leave_local_data_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("same-file.bin");
+        let item = Item {
+            path: "same-file.bin".into(),
+            size: 4,
+            version: "v1".into(),
+            url: None,
+            sha256: None,
+            object_id: None,
+            md5: None,
+        };
+        assert!(!destination_already_archived(&target, &item).unwrap());
+        std::fs::write(&target, b"1234").unwrap();
+        assert!(destination_already_archived(&target, &item).unwrap());
+        std::fs::write(&target, b"wrong-length").unwrap();
+        assert!(destination_already_archived(&target, &item).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"wrong-length");
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        assert!(destination_already_archived(&target, &item).is_err());
+        assert!(target.is_dir());
     }
 
 }

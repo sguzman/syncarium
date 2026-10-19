@@ -88,3 +88,7 @@ Authentication is explicitly an **operator task**, not an automation feature pla
 - A failed authentication must not reset or delete archives/checkpoints. Other healthy sources may still download, and the failing run returns a nonzero status for monitoring.
 
 This manual boundary is intentional. There is no automatic Google OAuth renewal milestone on the roadmap.
+
+## Local archive name or size conflict
+
+When Syncarium reports `existing archived path held`, its destination already exists but is not a regular file with the expected byte count, or is a symlink. Syncarium intentionally leaves the existing path untouched and continues with other safe objects. Inspect the path and source inventory; **do not delete files or rename whole archive trees just to clear the warning**. The read-only audit identifies mismatched-size files. Matching sizes alone do not prove content hashes are identical.
