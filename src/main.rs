@@ -647,6 +647,14 @@ fn state_file(root: &Path, source: &str, item: &Item) -> (PathBuf, PathBuf) {
     let dir = root.join(".syncarium").join("partials").join(source).join(&key[..2]);
     (dir.join(format!("{key}.part")), dir.join(format!("{key}.json")))
 }
+/// Flush directory entries when publishing state or archive hard links.
+fn sync_directory(directory: &Path) -> Result<()> {
+    File::open(directory)
+        .with_context(|| format!("opening directory for sync: {}", directory.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing directory: {}", directory.display()))
+}
+
 fn atomic_json<T: Serialize>(path: &Path, data: &T) -> Result<()> {
     let parent = path.parent().context("state without parent")?;
     fs::create_dir_all(parent)?;
@@ -656,6 +664,8 @@ fn atomic_json<T: Serialize>(path: &Path, data: &T) -> Result<()> {
     tmp.flush()?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| anyhow!("persisting checkpoint: {}", e.error))?;
+    // The JSON must survive a sudden power loss after the rename.
+    sync_directory(parent)?;
     Ok(())
 }
 fn checkpoint(root: &Path, source: &str, item: &Item, create: bool)
@@ -665,19 +675,35 @@ fn checkpoint(root: &Path, source: &str, item: &Item, create: bool)
     no_symlink_ancestors(&meta)?;
     let part_exists = part.exists();
     let meta_exists = meta.exists();
-    ensure!(part_exists == meta_exists,
-        "orphan partial/manifest for {}: manual review required", item.path);
+    let fresh = Checkpoint {
+        source: source.into(), path: item.path.clone(), size: item.size,
+        version: item.version.clone(), committed: 0,
+        last_offset: 0, last_size: 0, last_sha256: String::new(),
+        expected_sha256: item.sha256.clone(), expected_md5: item.md5.clone()
+    };
+    if part_exists && !meta_exists {
+        // The process could have crashed between create_new(.part) and the
+        // first manifest write. Only an EMPTY regular file is safe to adopt.
+        // A nonempty orphan might contain irreplaceable bytes: never reset it.
+        let metadata = fs::symlink_metadata(&part)?;
+        ensure!(metadata.file_type().is_file() && metadata.len() == 0,
+            "nonempty or unsafe orphan partial for {}: preserved for review", item.path);
+        if create {
+            atomic_json(&meta, &fresh)?;
+        }
+        return Ok((fresh, part, meta));
+    }
+    ensure!(!meta_exists || part_exists,
+        "orphan checkpoint manifest for {}: preserved for review", item.path);
     if !part_exists {
-        let cp = Checkpoint { source: source.into(), path: item.path.clone(),
-            size: item.size, version: item.version.clone(), committed: 0,
-            last_offset: 0, last_size: 0, last_sha256: String::new(),
-            expected_sha256: item.sha256.clone(), expected_md5: item.md5.clone() };
         if create {
             fs::create_dir_all(part.parent().context("no parent")?)?;
-            OpenOptions::new().write(true).create_new(true).open(&part)?;
-            atomic_json(&meta, &cp)?;
+            let file = OpenOptions::new().write(true).create_new(true).open(&part)?;
+            file.sync_all()?;
+            sync_directory(part.parent().context("no parent")?)?;
+            atomic_json(&meta, &fresh)?;
         }
-        return Ok((cp, part, meta));
+        return Ok((fresh, part, meta));
     }
     let cp: Checkpoint = serde_json::from_slice(&fs::read(&meta)?)?;
     ensure!(cp.source == source && cp.path == item.path
@@ -976,8 +1002,12 @@ fn publish(part: &Path, meta: &Path, destination: &Path, item: &Item) -> Result<
     no_symlink_ancestors(target.parent().context("missing parent")?)?;
     match fs::hard_link(part, &target) {
         Ok(()) => {
+            // Make the no-clobber destination name durable BEFORE removing
+            // its staging hard link. Otherwise a power loss could lose both.
+            sync_directory(target.parent().context("missing target parent")?)?;
             fs::remove_file(part)?;
             fs::remove_file(meta)?;
+            sync_directory(part.parent().context("missing staging parent")?)?;
             println!("COMPLETE {}", item.path);
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1418,6 +1448,68 @@ mod tests {
         std::fs::create_dir(&target).unwrap();
         assert!(destination_already_archived(&target, &item).is_err());
         assert!(target.is_dir());
+    }
+
+    #[test]
+    fn empty_orphan_partial_recovers_only_when_executing() {
+        let temp = tempfile::tempdir().unwrap();
+        let item = Item {
+            path: "photo.heic".into(), size: 1_000_000, version: "v1".into(),
+            url: None, sha256: None, object_id: None, md5: None
+        };
+        let (part, meta) = state_file(temp.path(), "photos", &item);
+        std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+        std::fs::write(&part, b"").unwrap();
+        let (preview, _, _) = checkpoint(temp.path(), "photos", &item, false).unwrap();
+        assert_eq!(preview.committed, 0);
+        assert!(!meta.exists(), "read-only planning must never repair state");
+        let (recovered, _, _) = checkpoint(temp.path(), "photos", &item, true).unwrap();
+        assert_eq!(recovered.committed, 0);
+        assert!(meta.exists(), "execution recovers the safe empty orphan");
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn nonempty_orphan_and_manifest_only_state_are_never_discarded() {
+        let temp = tempfile::tempdir().unwrap();
+        let item = Item {
+            path: "video.mov".into(), size: 10_000_000, version: "v1".into(),
+            url: None, sha256: None, object_id: None, md5: None
+        };
+        let (part, meta) = state_file(temp.path(), "videos", &item);
+        std::fs::create_dir_all(part.parent().unwrap()).unwrap();
+        std::fs::write(&part, b"precious uncommitted data").unwrap();
+        assert!(checkpoint(temp.path(), "videos", &item, false).is_err());
+        assert!(checkpoint(temp.path(), "videos", &item, true).is_err());
+        assert!(!meta.exists());
+        assert_eq!(std::fs::read(&part).unwrap(), b"precious uncommitted data");
+        std::fs::remove_file(&part).unwrap();
+        std::fs::write(&meta, b"{}").unwrap();
+        assert!(checkpoint(temp.path(), "videos", &item, true).is_err());
+        assert_eq!(std::fs::read(&meta).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn interrupted_tail_is_truncated_only_on_execute_and_last_chunk_is_verified() {
+        let temp = tempfile::tempdir().unwrap();
+        let item = Item {
+            path: "resume.bin".into(), size: 100, version: "v1".into(),
+            url: None, sha256: None, object_id: None, md5: None
+        };
+        let (mut cp, part, meta) = checkpoint(temp.path(), "fixture", &item, true).unwrap();
+        let chunk = temp.path().join("chunk");
+        std::fs::write(&chunk, b"committed").unwrap();
+        store_chunk(&part, &meta, &mut cp, &chunk).unwrap();
+        std::fs::OpenOptions::new().append(true).open(&part).unwrap()
+            .write_all(b"interrupted").unwrap();
+        checkpoint(temp.path(), "fixture", &item, false).unwrap();
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), 20);
+        let (restored, _, _) = checkpoint(temp.path(), "fixture", &item, true).unwrap();
+        assert_eq!(restored.committed, 9);
+        assert_eq!(std::fs::read(&part).unwrap(), b"committed");
+        std::fs::write(&part, b"tampered!").unwrap();
+        assert!(checkpoint(temp.path(), "fixture", &item, true).is_err());
+        assert_eq!(std::fs::read(&part).unwrap(), b"tampered!");
     }
 
 }
