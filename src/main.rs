@@ -114,6 +114,12 @@ struct Source {
     /// Optional sanity floor on current *eligible* provider-listed file count.
     #[serde(default)]
     min_items: Option<usize>,
+    /// Optional lower bound on summed known byte sizes from a provider listing.
+    #[serde(default)]
+    min_total_bytes: Option<u64>,
+    /// Hold this source when any previously observed remote identity vanishes.
+    #[serde(default)]
+    require_historical_coverage: bool,
     #[serde(flatten)]
     backend: Backend,
 }
@@ -682,6 +688,11 @@ fn validate(cfg: &Config) -> Result<()> {
             ensure!((1..=10_000_000).contains(&minimum),
                 "source {} min_items must be 1..10000000", s.name);
         }
+        if let Some(minimum) = s.min_total_bytes {
+            ensure!(minimum > 0, "source {} min_total_bytes must be positive", s.name);
+            ensure!(!matches!(s.backend, Backend::GoogleWorkspace { .. }),
+                "{} cannot use min_total_bytes: Workspace sizes are unknown before export", s.name);
+        }
         ensure!(s.destination.is_absolute(), "destination for {} must be absolute", s.name);
         clean_path(&s.destination)?;
         ensure!(s.destination.starts_with(&cfg.archive_root) && s.destination != cfg.archive_root,
@@ -874,12 +885,19 @@ fn eligible_google_objects(plan: drive_recovery::RecoveryPlan) -> (Vec<Item>, us
     (eligible, unresolved)
 }
 
-fn enforce_listing_floor(source: &Source, count: usize) -> Result<()> {
+fn enforce_listing_floor(source: &Source, count: usize, total_bytes: u64) -> Result<()> {
     if let Some(minimum) = source.min_items {
         ensure!(
             count >= minimum,
             "{} provider returned {} eligible items below configured min_items={minimum}; refusing incomplete inventory",
             source.name, count
+        );
+    }
+    if let Some(minimum) = source.min_total_bytes {
+        ensure!(
+            total_bytes >= minimum,
+            "{} provider listed {total_bytes} bytes below configured min_total_bytes={minimum}; refusing incomplete inventory",
+            source.name
         );
     }
     Ok(())
@@ -972,7 +990,12 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
         ensure!(seen.insert(candidate.relative_destination.clone()),
             "{} contains duplicate Workspace export destination", source.name);
     }
-    enforce_listing_floor(source, items.len() + exports.len())?;
+    // Known sizes only. Workspace exports have no size at enumeration time.
+    let total_bytes = items.iter().try_fold(0u64, |sum, item| {
+        sum.checked_add(item.size)
+            .context("provider inventory total size exceeds u64")
+    })?;
+    enforce_listing_floor(source, items.len() + exports.len(), total_bytes)?;
     items.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Listing { files: items, exports, unresolved })
 }
@@ -1430,12 +1453,13 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
         }
         let items = listing.files;
         let exports = listing.exports;
-        let observed = match inventory::observe(
-            &cfg.archive_root,
-            &source.name,
-            items.iter().map(|item| item.path.as_str())
-                .chain(exports.iter().map(|item| item.object_fingerprint.as_str())),
-            execute,
+        // Preview the complete inventory BEFORE persisting any observations.
+        // Strict sources (notably iCloud Photos) must never accept a
+        // truncated listing or stage its partial snapshot as the new baseline.
+        let identity_paths = || items.iter().map(|item| item.path.as_str())
+            .chain(exports.iter().map(|item| item.object_fingerprint.as_str()));
+        let inspected = match inventory::observe(
+            &cfg.archive_root, &source.name, identity_paths(), false
         ) {
             Ok(result) => result,
             Err(error) => {
@@ -1444,6 +1468,30 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
                 issues.push(message);
                 continue;
             }
+        };
+        if source.require_historical_coverage && inspected.absent > 0 {
+            let message = format!(
+                "{}: {} previously observed cloud identities missing; strict source held without transfer or inventory mutation",
+                source.name, inspected.absent
+            );
+            eprintln!("SOURCE HELD: {message}");
+            issues.push(message);
+            continue;
+        }
+        let observed = if execute {
+            match inventory::observe(
+                &cfg.archive_root, &source.name, identity_paths(), true
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    let message = format!("{}: inventory persistence failed: {error:#}", source.name);
+                    eprintln!("SOURCE FAILED: {message}");
+                    issues.push(message);
+                    continue;
+                }
+            }
+        } else {
+            inspected
         };
         if observed.absent > 0 {
             let message = format!(
@@ -1676,6 +1724,8 @@ mod tests {
             enabled: true,
             destination: PathBuf::from("/tmp/test"),
             min_items: None,
+            min_total_bytes: None,
+            require_historical_coverage: false,
             backend: Backend::Rclone { remote: "none:".into() },
         };
         let mut pending = Pending {
@@ -1843,15 +1893,17 @@ mod tests {
             enabled: true,
             destination: PathBuf::from("/tmp/photos"),
             min_items: Some(500),
+            min_total_bytes: None,
+            require_historical_coverage: false,
             backend: Backend::Rclone { remote: "photos:".into() },
         };
-        assert!(enforce_listing_floor(&source, 0).is_err());
-        assert!(enforce_listing_floor(&source, 499).is_err());
-        assert!(enforce_listing_floor(&source, 500).is_ok());
-        assert!(enforce_listing_floor(&source, 700).is_ok());
+        assert!(enforce_listing_floor(&source, 0, 0).is_err());
+        assert!(enforce_listing_floor(&source, 499, 0).is_err());
+        assert!(enforce_listing_floor(&source, 500, 0).is_ok());
+        assert!(enforce_listing_floor(&source, 700, 0).is_ok());
         // A deliberately unconfigured floor permits genuinely empty sources.
         let relaxed = Source { min_items: None, ..source };
-        assert!(enforce_listing_floor(&relaxed, 0).is_ok());
+        assert!(enforce_listing_floor(&relaxed, 0, 0).is_ok());
     }
 
     #[test]
@@ -2000,6 +2052,22 @@ mod tests {
         assert_eq!(budget, 12 * 1024 * 1024 - 10_000_000);
         assert_eq!(pending.export_index, 0);
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn bytes_floor_rejects_tiny_aggregate_even_at_expected_item_count() {
+        let source = Source {
+            name: "icloud-photos".into(),
+            enabled: true,
+            destination: PathBuf::from("/tmp/icloud-photos"),
+            min_items: Some(2),
+            min_total_bytes: Some(10_000),
+            require_historical_coverage: true,
+            backend: Backend::Rclone { remote: "photos:".into() },
+        };
+        assert!(enforce_listing_floor(&source, 2, 9_999).is_err());
+        assert!(enforce_listing_floor(&source, 2, 10_000).is_ok());
+        assert!(enforce_listing_floor(&source, 1, 100_000).is_err());
     }
 
 }
