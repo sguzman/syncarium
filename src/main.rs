@@ -18,6 +18,7 @@ use tempfile::NamedTempFile;
 
 mod inventory;
 mod drive_collisions;
+mod drive_recovery;
 
 #[derive(Parser)]
 #[command(about = "One-way, bandwidth-budgeted archival across independent sources")]
@@ -35,6 +36,18 @@ enum Action {
     Plan,
     /// Default is preview; --execute is required to download.
     Run { #[arg(long)] execute: bool },
+    /// Plan immutable-ID recovery locations without downloading payload.
+    DriveRecoveryPlan {
+        /// Configured Google Drive source name.
+        #[arg(long, default_value = "google-drive")]
+        source: String,
+        /// Optional local JSON fixture (for offline tests).
+        #[arg(long)]
+        fixture: Option<PathBuf>,
+        /// Show safe ID-derived destination paths in JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Read-only Google Drive immutable-ID duplicate name inspection.
     DriveCollisions {
         #[arg(long, default_value = "gdrive:")]
@@ -201,8 +214,67 @@ fn main() -> Result<()> {
             check_mount(&cfg)?;
             drive_collisions(&remote, json)?;
         },
+        Action::DriveRecoveryPlan { source, fixture, json } => {
+            drive_recovery_plan(&cfg, &source, fixture.as_deref(), json)?;
+        },
         Action::Plan => transfer_pass(&cfg, false)?,
         Action::Run { execute } => transfer_pass(&cfg, execute)?,
+    }
+    Ok(())
+}
+
+/// Pure planning: target paths depend solely on immutable Google object IDs.
+/// Never uses rclone copyid or writes a file to the archive.
+fn drive_recovery_plan(
+    cfg: &Config,
+    source_name: &str,
+    fixture: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    check_mount(cfg)?;
+    let source = cfg.sources.iter()
+        .find(|src| src.name == source_name)
+        .with_context(|| format!("Google Drive source '{source_name}' not configured"))?;
+    let remote = match &source.backend {
+        Backend::Rclone { remote } => remote.as_str(),
+        Backend::HttpManifest { .. } => bail!("Drive recovery requires an rclone source"),
+    };
+    ensure!(
+        source.destination.is_dir(),
+        "archive directory does not exist: {}",
+        source.destination.display()
+    );
+    no_symlink_ancestors(&source.destination)?;
+    let bytes = if let Some(path) = fixture {
+        no_symlink_ancestors(path)?;
+        fs::read(path).context("reading local-only recovery plan fixture")?
+    } else {
+        ensure!(
+            remote.contains(':') && !remote.starts_with('-')
+                && !remote.chars().any(char::is_control),
+            "invalid rclone remote"
+        );
+        let mut command = Command::new("rclone");
+        command.args(["backend", "query", remote, "trashed = false"]);
+        command_output_with_timeout(&mut command, Duration::from_secs(180))
+            .context("querying Drive IDs for a read-only recovery plan")?
+    };
+    ensure!(
+        bytes.len() <= 256 * 1024 * 1024,
+        "Drive object inventory exceeds the 256 MiB in-memory planner limit"
+    );
+    let plan = drive_recovery::plan_recovery_json(&bytes)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        println!("Read-only ID-based recovery plan for {}", source.name);
+        println!("{} recoverable candidates", plan.items.len());
+        println!("{} bytes of known-size objects", plan.known_size_bytes);
+        println!("{} objects require size/format verification", plan.unknown_size);
+        println!("{} unsupported Drive-native/shortcut objects", plan.unsupported);
+        println!("Candidate destinations: {}",
+            source.destination.join(".rclone-duplicates/objects").display());
+        println!("No cloud files or local archive files were modified.");
     }
     Ok(())
 }

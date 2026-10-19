@@ -69,3 +69,7 @@ Once `run --execute` completes a valid source inventory listing, Syncarium keeps
 ## Google Drive identity audit
 
 Use `syncarium --config ~/.config/syncarium/config.toml drive-collisions --remote gdrive: --json` to inspect duplicate filenames/folders from provider object metadata. It may use considerable API listing bandwidth but does not download file contents or change either archive. It fails with a nonzero status on duplicates, empty response or query error. This is a diagnostic; keep the legacy Google duplicate-recovery tool until Syncarium implements equivalent recovery.
+
+## Read-only ID recovery planning
+
+`syncarium --config ~/.config/syncarium/config.toml drive-recovery-plan --source google-drive --json` computes stable hashed destination paths for Google Drive collision candidates. This consumes metadata API requests but does **not** download files or create directories. For an offline test, add `--fixture /absolute/path/to/google-objects.json` with a local Google `backend query` fixture (treat it as private). Output does not include raw names or object IDs, but filenames and other source data may still be sensitive. Size-unknown items and unsupported shortcuts are reported explicitly. **Do not disable legacy Google recovery yet.**

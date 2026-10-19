@@ -60,3 +60,7 @@ Candidates: OpenDAL-based Google Drive, WebDAV, SFTP, custom download APIs, and 
 ## Google Drive collision audit
 
 The optional `drive-collisions --remote gdrive:` command uses the read-only `rclone backend query gdrive: 'trashed = false'` API and analyzes stable object IDs, parent IDs and names in Rust. It reports aggregate counts, including duplicate folder descendants invisible to a path-based listing. No personal object names are printed. This is not duplicate **recovery**: the Rust engine will need an ID-addressed downloader and provenance sidecars before it can replace the legacy Google recovery job. Query coverage and configured Docs export formats can affect results.
+
+## ID recovery plans
+
+The `drive-recovery-plan` operation is independent of the ordinary path-based scheduler and is read-only. It maps colliding immutable Google file IDs to stable SHA-256-derived destinations, covering descendants of colliding folders. Run it with `--source google-drive` for the `google-drive` TOML entry; `--fixture <absolute JSON path>` is available for offline validation. No object data is fetched and no payload is published. Actual ID-based recovery needs a backend capable of budgeted, resumable range reads by immutable object ID. Do **not** replace the legacy duplicate-recovery service on the strength of the planner alone.

@@ -68,3 +68,7 @@ License: MIT.
 ### Google Drive immutable-ID diagnostic
 
 Run `syncarium --config ~/.config/syncarium/config.toml drive-collisions --remote gdrive: --json` to inspect Google Drive object IDs for duplicate sibling names, Google Docs export-name collisions and files obscured by duplicate-named folders. This is metadata-only, can consume API requests, and has a 180-second query timeout. It **does not** yet download these duplicate objects. It returns nonzero when collisions are detected.
+
+## Planned Google Drive ID recovery
+
+Use `drive-recovery-plan --source google-drive [--json]` to build a deterministic **read-only** list of identity-addressed recovery destinations for colliding Google Drive files and descendants of ambiguous folders. The planner maps immutable object IDs to SHA-256-based local names beneath `.rclone-duplicates/objects/`, avoiding exposure of private original names in output filenames. Size-unknown Google Docs exports are reported separately and **not** assumed to fit a byte budget. Neither planning nor the current collision audit downloads anything. Full ID-based actual recovery is not yet enabled: rclone `backend copyid` transfers whole objects and cannot currently meet cross-run strict chunk budgets for large files.

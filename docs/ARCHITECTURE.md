@@ -72,3 +72,7 @@ Successful **executing** passes keep source-path SHA-256 fingerprints under `/dr
 ## Google Drive path collisions
 
 The `drive-collisions` command compares immutable Drive object IDs for siblings that map to the same output filename, considering common Google-native Docs export extensions. It also walks descendants of same-named folders. A path-based rclone listing alone cannot prove these objects are present. The command is explicit and read-only; no automatic ID-based recovery is claimed.
+
+## ID recovery planning (not transfers)
+
+The read-only `drive-recovery-plan` CLI selects ambiguous Google file objects by their immutable IDs rather than any path-based rclone resolution. It detects sibling file-output collisions, duplicate folders, file-versus-folder collisions, and all descendant files reachable from ambiguous folders. A SHA-256 fingerprint of each Google file ID generates a deterministic destination under `.rclone-duplicates/objects/`. Original names are excluded from filesystem path elements. Unknown file sizes and unsupported Google types are explicitly counted. This plan is **not** a complete recovery implementation: `rclone backend copyid` fetches a whole object, potentially violating the global byte limit for large files. We must build and validate a resumable, ID-addressed reader before enabling execution.
