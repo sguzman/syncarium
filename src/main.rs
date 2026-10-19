@@ -171,6 +171,7 @@ struct AuditSource {
     staged_saved_bytes: u64,
     staged_remaining_bytes: u64,
     held_files: u64,
+    unresolved_provider_items: u64,
     historical_absent: u64,
     historical_ever_seen: u64,
     newly_observed: u64,
@@ -183,6 +184,12 @@ struct AuditReport {
     sources: Vec<AuditSource>,
     warning: &'static str,
 }
+struct Listing {
+    files: Vec<Item>,
+    /// Provider-visible objects not eligible for bounded, verified transfer.
+    unresolved: usize,
+}
+
 struct Pending {
     source: Source,
     files: Vec<Item>,
@@ -343,7 +350,12 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
                 row.error = Some(format!("{error:#}"));
                 errors += 1;
             }
-            Ok(items) => {
+            Ok(listing) => {
+                if listing.unresolved > 0 {
+                    row.unresolved_provider_items = listing.unresolved as u64;
+                    errors += 1;
+                }
+                let items = listing.files;
                 match inventory::observe(
                     &cfg.archive_root,
                     &source.name,
@@ -417,10 +429,11 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
                 println!("{}: listing FAILED: {}", row.name, error);
             } else {
                 println!(
-                    "{}: {} listed, {} size-matched local, {} staged, {} missing, {} mismatched, {} held, {} historically observed but absent",
+                    "{}: {} eligible listed, {} size-matched local, {} staged, {} missing, {} mismatched, {} held, {} unresolved, {} historically observed but absent",
                     row.name, row.listed_files, row.present_size_matched,
                     row.staged_files, row.missing_files,
-                    row.present_size_mismatch, row.held_files, row.historical_absent
+                    row.present_size_mismatch, row.held_files,
+                    row.unresolved_provider_items, row.historical_absent
                 );
                 println!(
                     "  Pending: {} MiB wholly missing, {} MiB remaining in partials",
@@ -691,8 +704,8 @@ fn checkpoint(root: &Path, source: &str, item: &Item, create: bool)
     }
     Ok((cp, part, meta))
 }
-fn read_items(source: &Source, listing_timeout: Duration) -> Result<Vec<Item>> {
-    let mut items = match &source.backend {
+fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
+    let (mut items, unresolved) = match &source.backend {
         Backend::Rclone { remote } => {
             let mut command = Command::new("rclone");
             command.args(["lsjson", remote, "--recursive", "--files-only",
@@ -718,7 +731,7 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Vec<Item>> {
                 items.push(Item { path: path.into(), size, version, url: None,
                     sha256: None, object_id: None, md5: None });
             }
-            items
+            (items, 0)
         }
         Backend::GoogleDriveIds { remote, .. } => {
             // Metadata-only enumeration through the already authorized rclone
@@ -729,13 +742,9 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Vec<Item>> {
             ensure!(raw.len() <= 256 * 1024 * 1024,
                 "Google Drive ID listing exceeds 256 MiB limit");
             let plan = drive_recovery::plan_recovery_json(&raw)?;
-            if plan.unknown_size > 0 || plan.unsupported > 0 {
-                eprintln!(
-                    "{}: {} size-unknown objects and {} unsupported objects require separate recovery",
-                    source.name, plan.unknown_size, plan.unsupported
-                );
-            }
-            plan.items.into_iter().filter_map(|item| {
+            let total_candidates = plan.items.len();
+            let unsupported = plan.unsupported;
+            let eligible: Vec<Item> = plan.items.into_iter().filter_map(|item| {
                 // A native byte-range reader needs exact size and a source
                 // checksum. Google Docs exports do not provide either.
                 match (item.source_size, item.md5) {
@@ -747,16 +756,20 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Vec<Item>> {
                         }),
                     _ => None,
                 }
-            }).collect()
+            }).collect();
+            // Skip count includes unsupported native formats, unknown export
+            // sizes, and binaries lacking usable provider MD5 checksums.
+            let unresolved = total_candidates - eligible.len() + unsupported;
+            (eligible, unresolved)
         }
         Backend::HttpManifest { manifest } => {
             no_symlink_ancestors(manifest)?;
             let entries: Vec<HttpEntry> = serde_json::from_slice(&fs::read(manifest)?)?;
-            entries.into_iter().map(|e| Item {
+            (entries.into_iter().map(|e| Item {
                 path:e.path, size:e.size, version:e.version, url: Some(e.url),
                 sha256:e.sha256.map(|hash| hash.to_ascii_lowercase()),
                 object_id: None, md5: None
-            }).collect()
+            }).collect(), 0)
         }
     };
     let mut seen = HashSet::new();
@@ -778,7 +791,7 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Vec<Item>> {
         }
     }
     items.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(items)
+    Ok(Listing { files: items, unresolved })
 }
 fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
     let stdout = NamedTempFile::new()?;
@@ -1049,8 +1062,8 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
             issues.push(message);
             continue;
         }
-        let items = match read_items(source, remaining.min(Duration::from_secs(180))) {
-            Ok(items) => items,
+        let listing = match read_items(source, remaining.min(Duration::from_secs(180))) {
+            Ok(listing) => listing,
             Err(error) => {
                 let message = format!("{}: listing failed: {error:#}", source.name);
                 eprintln!("SOURCE FAILED: {message}");
@@ -1058,6 +1071,15 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
                 continue;
             }
         };
+        if listing.unresolved > 0 {
+            let message = format!(
+                "{}: {} Google Drive collision objects not eligible for verified ranged recovery; needs separate handling",
+                source.name, listing.unresolved
+            );
+            eprintln!("SOURCE INCOMPLETE: {message}");
+            issues.push(message);
+        }
+        let items = listing.files;
         let observed = match inventory::observe(
             &cfg.archive_root,
             &source.name,

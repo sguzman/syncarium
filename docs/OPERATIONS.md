@@ -73,3 +73,7 @@ Use `syncarium --config ~/.config/syncarium/config.toml drive-collisions --remot
 ## Read-only ID recovery planning
 
 `syncarium --config ~/.config/syncarium/config.toml drive-recovery-plan --source google-drive --json` computes stable hashed destination paths for Google Drive collision candidates. This consumes metadata API requests but does **not** download files or create directories. For an offline test, add `--fixture /absolute/path/to/google-objects.json` with a local Google `backend query` fixture (treat it as private). Output does not include raw names or object IDs, but filenames and other source data may still be sensitive. Size-unknown items and unsupported shortcuts are reported explicitly. **Do not disable legacy Google recovery yet.**
+
+## Native Google ID coverage gaps
+
+The opt-in `google_drive_ids` adapter only downloads candidate objects with an exact source size **and** valid Google provider MD5. Unsupported shortcuts, Google Workspace exports, and files without verification metadata are counted as `unresolved_provider_items` by `audit --json`. When using `plan` or `run --execute`, unresolved items produce a `SOURCE INCOMPLETE` warning and a **nonzero** overall exit status, even if eligible files make progress. This prevents silently declaring a partially supported Google archive complete. Resolve these objects with a future dedicated exporter; do not delete the legacy downloader yet.
