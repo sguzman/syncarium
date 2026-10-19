@@ -14,6 +14,12 @@ jobs:
           components: rustfmt, clippy
       - name: Format source for build validation
         run: cargo fmt --all
+      - name: Install rclone for offline local-backend integration test
+        run: |
+          if ! command -v rclone >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y rclone
+          fi
       - name: Compile and test
         run: cargo test --all-targets
       - name: Lint
