@@ -30,6 +30,11 @@ kind = "rclone"
 enabled = false
 # Optional after confirming a baseline with read-only plan:
 # min_items = 10000
+# Optional after measuring a stable library size (count is not proof of coverage):
+# min_total_bytes = 50000000000
+# Optional STRICT mode: hold this source if any previously observed cloud path
+# vanishes, including intentional deletions/renames. Disabled by default:
+# require_historical_coverage = true
 remote = "icloudphotos:PrimarySync/All Photos"
 destination = "/drive/icloud/photos/primary"
 
