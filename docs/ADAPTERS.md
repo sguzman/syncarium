@@ -36,12 +36,13 @@ The local manifest is a **JSON array**:
     "path": "folder/sample.bin",
     "size": 1024000,
     "url": "https://example.com/files/sample.bin",
-    "version": "etag-or-immutable-version-id-v1"
+    "version": "etag-or-immutable-version-id-v1",
+    "sha256": "64-character lowercase SHA-256 digest if known"
   }
 ]
 ```
 
-`path` is always relative to the destination and cannot contain absolute paths, `..`, newlines or backslashes. `size` is the exact byte size. `url` must be HTTPS and support **206 Partial Content** and `Content-Range` for requested bytes. `version` must change if the data changes. This adapter never writes to the remote.
+`path` is always relative to the destination and cannot contain absolute paths, `..`, newlines or backslashes. `size` is the exact byte size. `url` must be HTTPS and support **206 Partial Content** and `Content-Range` for requested bytes. `version` must change if the data changes. Optional `sha256` is a 64-character hex digest; when present, the entire assembled file is SHA-256 verified **before** publication, and mismatches leave the partial intact for review. The value shown above is explanatory, not a valid hash; replace it with a real digest or omit it. This adapter never writes to the remote.
 
 Put manifests with signed/private URLs in `~/.config/syncarium/` with `chmod 600`; never in the public repo. Test endpoints independently before production use. Tokens embedded in a URL should be treated as passwords.
 

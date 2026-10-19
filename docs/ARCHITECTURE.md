@@ -37,7 +37,7 @@ Each source-item path is mapped to a SHA-256-keyed pair of files: `.part` and `.
 5. Verify the recorded last chunk. Resume the next offset.
 6. At exactly total size, hard-link the partial to the final destination without replacing an existing file. Only then remove staging.
 
-A failure can leave an orphaned partial if it occurs at an unlucky step. Fail closed and report the orphan; do not silently discard earlier progress. The current implementation verifies only the **last saved chunk**, not the entire file against a provider hash. Adding full independent hash verification and append-only provenance manifests is roadmap work.
+A failure can leave an orphaned partial if it occurs at an unlucky step. Fail closed and report the orphan; do not silently discard earlier progress. The current implementation verifies the **last saved chunk** during resumption. Native HTTP manifests may also supply an optional **SHA-256 of the entire file**, which is validated before publication. Rclone-backed objects without trusted provider hashes cannot yet be verified cryptographically end-to-end. Adding full independent hash verification and append-only provenance manifests is roadmap work.
 
 ## Current known deficits
 

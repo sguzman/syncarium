@@ -75,6 +75,7 @@ struct Item {
     size: u64,
     version: String,
     url: Option<String>,
+    sha256: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Checkpoint {
@@ -86,6 +87,8 @@ struct Checkpoint {
     last_offset: u64,
     last_size: u64,
     last_sha256: String,
+    #[serde(default)]
+    expected_sha256: Option<String>,
 }
 #[derive(Deserialize)]
 struct HttpEntry {
@@ -93,6 +96,8 @@ struct HttpEntry {
     size: u64,
     url: String,
     version: String,
+    #[serde(default)]
+    sha256: Option<String>,
 }
 #[derive(Serialize, Deserialize, Default)]
 struct Rotation {
@@ -357,7 +362,8 @@ fn checkpoint(root: &Path, source: &str, item: &Item, create: bool)
     if !part_exists {
         let cp = Checkpoint { source: source.into(), path: item.path.clone(),
             size: item.size, version: item.version.clone(), committed: 0,
-            last_offset: 0, last_size: 0, last_sha256: String::new() };
+            last_offset: 0, last_size: 0, last_sha256: String::new(),
+            expected_sha256: item.sha256.clone() };
         if create {
             fs::create_dir_all(part.parent().context("no parent")?)?;
             OpenOptions::new().write(true).create_new(true).open(&part)?;
@@ -367,7 +373,8 @@ fn checkpoint(root: &Path, source: &str, item: &Item, create: bool)
     }
     let cp: Checkpoint = serde_json::from_slice(&fs::read(&meta)?)?;
     ensure!(cp.source == source && cp.path == item.path
-        && cp.size == item.size && cp.version == item.version,
+        && cp.size == item.size && cp.version == item.version
+        && cp.expected_sha256 == item.sha256,
         "source changed during staged download: {}; preserved for review", item.path);
     ensure!(cp.committed <= item.size, "invalid stored byte offset");
     let actual = fs::metadata(&part)?.len();
@@ -407,7 +414,7 @@ fn read_items(source: &Source) -> Result<Vec<Item>> {
                     "modtime":value.get("ModTime"), "id":value.get("ID"),
                     "hashes":value.get("Hashes")
                 }))?;
-                items.push(Item { path: path.into(), size, version, url: None });
+                items.push(Item { path: path.into(), size, version, url: None, sha256: None });
             }
             items
         }
@@ -415,7 +422,8 @@ fn read_items(source: &Source) -> Result<Vec<Item>> {
             no_symlink_ancestors(manifest)?;
             let entries: Vec<HttpEntry> = serde_json::from_slice(&fs::read(manifest)?)?;
             entries.into_iter().map(|e| Item {
-                path:e.path, size:e.size, version:e.version, url: Some(e.url)
+                path:e.path, size:e.size, version:e.version, url: Some(e.url),
+                sha256:e.sha256.map(|hash| hash.to_ascii_lowercase())
             }).collect()
         }
     };
@@ -427,6 +435,10 @@ fn read_items(source: &Source) -> Result<Vec<Item>> {
             source.name, item.path);
         if let Some(url) = &item.url {
             ensure!(url.starts_with("https://"), "HTTP manifest requires HTTPS URLs");
+        }
+        if let Some(hash) = &item.sha256 {
+            ensure!(hash.len() == 64 && hash.bytes().all(|ch| ch.is_ascii_hexdigit()),
+                "invalid SHA-256 fingerprint for {}", item.path);
         }
     }
     items.sort_by(|a, b| a.path.cmp(&b.path));
@@ -525,20 +537,40 @@ fn store_chunk(part: &Path, meta: &Path, cp: &mut Checkpoint, chunk: &Path) -> R
     cp.last_sha256 = hex::encode(Sha256::digest(&content));
     atomic_json(meta, cp)
 }
-fn publish(part: &Path, meta: &Path, destination: &Path, relative: &str, expected: u64) -> Result<()> {
-    let target = destination.join(safe_relative(relative)?);
+fn publish(part: &Path, meta: &Path, destination: &Path, item: &Item) -> Result<()> {
+    let target = destination.join(safe_relative(&item.path)?);
     no_symlink_ancestors(&target)?;
-    ensure!(fs::metadata(part)?.len() == expected, "cannot publish incomplete file");
+    ensure!(
+        fs::metadata(part)?.len() == item.size,
+        "cannot publish incomplete file"
+    );
+    if let Some(expected) = &item.sha256 {
+        let mut reader = File::open(part)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 256 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        ensure!(
+            hex::encode(hasher.finalize()) == *expected,
+            "whole-file SHA-256 mismatch for {}; preserving partial for review",
+            item.path
+        );
+    }
     fs::create_dir_all(target.parent().context("missing parent")?)?;
     no_symlink_ancestors(target.parent().context("missing parent")?)?;
     match fs::hard_link(part, &target) {
         Ok(()) => {
             fs::remove_file(part)?;
             fs::remove_file(meta)?;
-            println!("COMPLETE {}", relative);
+            println!("COMPLETE {}", item.path);
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            println!("PRESERVE existing local file {}", relative);
+            println!("PRESERVE existing local file {}", item.path);
         }
         Err(e) => return Err(e.into()),
     }
@@ -572,13 +604,7 @@ fn advance_source(
     let (mut cp, part, meta) =
         checkpoint(&cfg.archive_root, &pending.source.name, item, true)?;
     if cp.committed == item.size {
-        publish(
-            &part,
-            &meta,
-            &pending.source.destination,
-            &item.path,
-            item.size,
-        )?;
+        publish(&part, &meta, &pending.source.destination, item)?;
         pending.index += 1;
         return Ok(true);
     }
@@ -610,13 +636,7 @@ fn advance_source(
     )?;
     store_chunk(&part, &meta, &mut cp, chunk.path())?;
     if cp.committed == item.size {
-        publish(
-            &part,
-            &meta,
-            &pending.source.destination,
-            &item.path,
-            item.size,
-        )?;
+        publish(&part, &meta, &pending.source.destination, item)?;
         pending.index += 1;
     }
     Ok(true)
@@ -778,7 +798,7 @@ mod tests {
     fn new_checkpoints_do_not_limit_file_size() {
         let tmp = tempfile::tempdir().unwrap();
         let item = Item { path: "large.mp4".into(), size: 10_000_000_000,
-            version: "v1".into(), url: None };
+            version: "v1".into(), url: None, sha256: None };
         let (cp, part, _) = checkpoint(tmp.path(), "photos", &item, false).unwrap();
         assert_eq!(cp.committed, 0);
         assert!(!part.exists());
@@ -786,9 +806,34 @@ mod tests {
     #[test]
     fn atomic_state_detects_source_changes() {
         let tmp = tempfile::tempdir().unwrap();
-        let item = Item { path: "x".into(), size: 100, version: "v1".into(), url: None };
+        let item = Item { path: "x".into(), size: 100, version: "v1".into(), url: None, sha256: None };
         checkpoint(tmp.path(), "photos", &item, true).unwrap();
         let other = Item { version: "v2".into(), ..item };
         assert!(checkpoint(tmp.path(), "photos", &other, false).is_err());
     }
+    #[test]
+    fn valid_sha256_is_checked_before_immutable_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destination = tmp.path().join("archive");
+        std::fs::create_dir(&destination).unwrap();
+        let part = tmp.path().join("file.part");
+        let meta = tmp.path().join("file.json");
+        std::fs::write(&part, b"correct-data").unwrap();
+        std::fs::write(&meta, b"{}").unwrap();
+        let mut item = Item {
+            path: "file.bin".into(),
+            size: 12,
+            version: "v1".into(),
+            url: None,
+            sha256: Some(hex::encode(Sha256::digest(b"different-data"))),
+        };
+        assert!(publish(&part, &meta, &destination, &item).is_err());
+        assert!(!destination.join("file.bin").exists());
+        assert!(part.exists(), "bad checksum must preserve the partial");
+        item.sha256 = Some(hex::encode(Sha256::digest(b"correct-data")));
+        publish(&part, &meta, &destination, &item).unwrap();
+        assert_eq!(std::fs::read(destination.join("file.bin")).unwrap(), b"correct-data");
+        assert!(!part.exists());
+    }
+
 }
