@@ -1042,6 +1042,65 @@ fn command_output_with_limit(
         thread::sleep(Duration::from_millis(100));
     }
 }
+/// Bound bytes inside Rust rather than trusting rclone cat --count.
+/// No stdout byte beyond the caller's reservation is written to disk.
+fn bounded_rclone_chunk(
+    command: &mut Command,
+    count: u64,
+    deadline: Duration,
+    staging: &Path,
+) -> Result<()> {
+    ensure!(count > 0 && count <= 64 * 1024 * 1024,
+        "invalid reserved provider chunk size");
+    ensure!(deadline > Duration::ZERO, "provider deadline must be positive");
+    no_symlink_ancestors(staging)?;
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = command.spawn().context("starting bounded provider transfer")?;
+    let mut stdout = child.stdout.take().context("rclone stdout pipe missing")?;
+    let path = staging.to_path_buf();
+    // A dedicated reader permits a strict deadline on a stalled subprocess.
+    let reader = thread::spawn(move || -> Result<u64> {
+        let mut file = OpenOptions::new().write(true).truncate(true).open(&path)?;
+        let mut written = 0u64;
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let n = stdout.read(&mut buffer)
+                .context("provider transfer stream read failed")?;
+            if n == 0 {
+                break;
+            }
+            let new_size = written.checked_add(n as u64)
+                .context("provider transfer exceeded integer byte range")?;
+            ensure!(new_size <= count,
+                "rclone returned more bytes than the reserved chunk; transfer rejected");
+            file.write_all(&buffer[..n])?;
+            written = new_size;
+        }
+        file.sync_all()?;
+        Ok(written)
+    });
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if start.elapsed() >= deadline {
+            child.kill().ok();
+            child.wait().ok();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    // After process exit or forced kill the pipe closes. Failed temporary
+    // chunks cannot be published by their callers.
+    let copied = reader.join().map_err(|_| anyhow!("provider reader thread panicked"))??;
+    ensure!(status.is_some(), "rclone transfer timed out");
+    ensure!(status.is_some_and(|status| status.success()), "rclone ranged download failed");
+    ensure!(copied == count,
+        "rclone returned {copied} bytes rather than reserved {count}");
+    Ok(())
+}
+
 fn download_range(source: &Source, item: &Item, offset: u64, count: u64,
     rate_kib: u64, deadline: Duration, staging: &Path) -> Result<()> {
     match &source.backend {
@@ -1062,22 +1121,7 @@ fn download_range(source: &Source, item: &Item, offset: u64, count: u64,
             cmd.args(["cat", &path, "--offset", &offset.to_string(),
                 "--count", &count.to_string(), "--bwlimit", &format!("{rate_kib}K"),
                 "--retries", "1", "--low-level-retries", "1"]);
-            cmd.stdout(Stdio::from(OpenOptions::new().write(true).truncate(true).open(staging)?))
-                .stderr(Stdio::null());
-            let mut child = cmd.spawn().context("starting rclone cat")?;
-            let start = Instant::now();
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    ensure!(status.success(), "rclone ranged download failed");
-                    break;
-                }
-                if start.elapsed() >= deadline {
-                    child.kill().ok();
-                    child.wait().ok();
-                    bail!("rclone transfer timed out");
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
+            bounded_rclone_chunk(&mut cmd, count, deadline, staging)?;
         }
         Backend::HttpManifest { .. } => {
             let url = item.url.as_deref().context("missing URL in HTTP manifest")?;
@@ -2122,6 +2166,45 @@ mod tests {
             &mut delayed, Duration::from_millis(50), 1024
         ).unwrap_err();
         assert!(format!("{err:#}").contains("timeout"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rclone_chunk_rejects_overlong_and_short_success_outputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("chunk");
+        std::fs::write(&stage, b"").unwrap();
+        let mut good = Command::new("sh");
+        good.args(["-c", "printf '12345678'"]);
+        bounded_rclone_chunk(&mut good, 8, Duration::from_secs(3), &stage).unwrap();
+        assert_eq!(std::fs::read(&stage).unwrap(), b"12345678");
+
+        let mut overflow = Command::new("sh");
+        overflow.args(["-c", "head -c 8192 /dev/zero"]);
+        let err = bounded_rclone_chunk(
+            &mut overflow, 8, Duration::from_secs(3), &stage).unwrap_err();
+        assert!(format!("{err:#}").contains("more bytes"));
+        assert!(std::fs::metadata(&stage).unwrap().len() <= 8,
+            "a bad provider must not write beyond the byte reservation");
+
+        let mut short = Command::new("sh");
+        short.args(["-c", "printf 'abc'"]);
+        let err = bounded_rclone_chunk(
+            &mut short, 8, Duration::from_secs(3), &stage).unwrap_err();
+        assert!(format!("{err:#}").contains("rather than reserved"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_provider_transfer_times_out_without_publishing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("chunk");
+        std::fs::write(&stage, b"").unwrap();
+        let mut stalled = Command::new("sh");
+        stalled.args(["-c", "exec sleep 2"]);
+        let err = bounded_rclone_chunk(
+            &mut stalled, 32, Duration::from_millis(70), &stage).unwrap_err();
+        assert!(format!("{err:#}").contains("timed out"));
     }
 
 }
