@@ -89,3 +89,5 @@ For the native Rust Google ID adapter specifically, `token_file` contains a **sh
 Other already-authorized sources can continue within the same bandwidth budget. Nothing in Syncarium may delete or overwrite local archive data because authentication expires. There is **no planned custom Google OAuth implementation**; improving the transfer engine, source coverage, and archive integrity takes priority.
 
 - **Existing destination conflict protection:** completed paths must be regular files whose size matches the currently listed source item. Mismatched sizes, directories and symbolic links are preserved and flagged, not silently counted as archived or overwritten. A matching length is only a preliminary check, not a verified content hash.
+
+- **Power-loss hardening:** durable directory flushes for checkpoint renames and completed hard-link publication, plus safe automatic repair of empty partials left by an interrupted initial checkpoint write. Nonempty or ambiguous orphan state is preserved for investigation.

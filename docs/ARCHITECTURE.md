@@ -98,3 +98,9 @@ The native Google ID adapter's short-lived bearer token is a **manual-session cr
 ## Existing local destination checks
 
 The run planner and the per-chunk execution path inspect existing archive destinations with no-follow filesystem metadata. If a target is an ordinary file of the source-reported size, the path is treated as already archived without overwriting it. A symlink, directory, or differing local size is a **conflict** and causes a held-item report plus a nonzero pass outcome; existing bytes are never replaced. Same-sized content could still be different. Full checksum verification of preexisting files requires explicit provenance and an efficient audit design; a size match must not be described as cryptographic integrity proof.
+
+## Crash consistency at checkpoint creation and final publication
+
+Syncarium flushes newly created staging files and their directory entries before persisting the corresponding JSON checkpoint. Atomic JSON renames are followed by a directory sync so checkpoint updates survive sudden interruptions more reliably. When publishing, the completed archive hard link's **destination directory is synced before staging links are removed**. These measures protect against a power loss between the last successful chunk and publishing the final name, but they do not replace a full filesystem integrity check or an uninterruptible power supply.
+
+If a process crashes after creating a brand-new empty `.part` file but before its JSON sidecar, the **next executing pass** can safely recreate the initial checkpoint without discarding any downloaded bytes. A read-only pass does not mutate it. Orphans containing **nonzero bytes** and manifest-only state are never automatically discarded or reset, because recovery cannot safely determine what those bytes represent. Unexpectedly truncated staged data and bad checksums continue to fail closed.

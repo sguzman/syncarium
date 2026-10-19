@@ -92,3 +92,9 @@ This manual boundary is intentional. There is no automatic Google OAuth renewal 
 ## Local archive name or size conflict
 
 When Syncarium reports `existing archived path held`, its destination already exists but is not a regular file with the expected byte count, or is a symlink. Syncarium intentionally leaves the existing path untouched and continues with other safe objects. Inspect the path and source inventory; **do not delete files or rename whole archive trees just to clear the warning**. The read-only audit identifies mismatched-size files. Matching sizes alone do not prove content hashes are identical.
+
+## Crash recovery after a power interruption
+
+A zero-byte partial file left behind before its checkpoint was first created is now recovered automatically on the **next live executing run**; `plan` remains read-only. If the orphan partial contains any bytes, or only a JSON manifest survives, Syncarium stops that item and preserves both state and data for investigation. Previously committed chunks are verified on resumption; excess uncommitted bytes are truncated only in execute mode.
+
+Publishing now forces the completed destination directory entry to disk before the corresponding staged hard link and checkpoint are removed. Do not move or edit `/drive/.syncarium/partials` while a download is running. Interrupted state is supposed to survive a reboot so downloads can resume without starting over.
