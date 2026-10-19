@@ -22,6 +22,7 @@ mod drive_recovery;
 mod drive_id;
 mod drive_workspace;
 mod provider_probe;
+mod photos_inventory;
 mod receipts;
 
 #[derive(Parser)]
@@ -47,6 +48,20 @@ enum Action {
         #[arg(long)]
         source: String,
         /// Explicit opt-in to contact the source and read sample bytes.
+        #[arg(long)]
+        execute: bool,
+    },
+    /// Inspect iCloud-style photo inventory quality and possible still/video pairs.
+    /// Without --execute or a local fixture, does not contact the provider.
+    PhotosInventory {
+        #[arg(long)]
+        source: String,
+        /// Private rclone lsjson fixture; bypasses all cloud access.
+        #[arg(long)]
+        fixture: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+        /// Permit one read-only provider metadata listing.
         #[arg(long)]
         execute: bool,
     },
@@ -278,6 +293,8 @@ fn main() -> Result<()> {
         Action::Audit { json } => audit(&cfg, json)?,
         Action::ProbeRange { source, execute } =>
             provider_probe::probe(&cfg, &source, execute)?,
+        Action::PhotosInventory { source, fixture, json, execute } =>
+            photos_inventory::inspect(&cfg, &source, fixture.as_deref(), execute, json)?,
         Action::DriveCollisions { remote, json } => {
             check_mount(&cfg)?;
             drive_collisions(&remote, json)?;
@@ -921,6 +938,39 @@ fn enforce_listing_floor(source: &Source, count: usize, total_bytes: u64) -> Res
     Ok(())
 }
 
+/// Parse rclone's complete lsjson response for both the normal scheduler
+/// and read-only photo diagnostics. Reject malformed or duplicate entries;
+/// neither path should turn a partial JSON array into a valid inventory.
+fn parse_rclone_inventory(raw: &[u8], source_name: &str) -> Result<Vec<Item>> {
+    let values: Vec<serde_json::Value> = serde_json::from_slice(raw)
+        .context("invalid provider listing JSON")?;
+    let mut items = Vec::with_capacity(values.len());
+    let mut seen = HashSet::new();
+    for value in values {
+        let (Some(path), Some(size)) = (
+            value.get("Path").and_then(|x| x.as_str()),
+            value.get("Size").and_then(|x| x.as_u64()),
+        ) else {
+            bail!("{source_name} returned a file without valid path and size; refusing incomplete inventory");
+        };
+        ensure!(!path.is_empty(), "{source_name} returned empty file path");
+        safe_relative(path)?;
+        ensure!(seen.insert(path.to_string()),
+            "{source_name} listed a duplicate destination path; inventory requires identity-aware recovery");
+        // No original personal names are serialized into diagnostic reports.
+        let version = serde_json::to_string(&serde_json::json!({
+            "modtime": value.get("ModTime"),
+            "id": value.get("ID"),
+            "hashes": value.get("Hashes"),
+        }))?;
+        items.push(Item {
+            path: path.to_string(), size, version,
+            url: None, sha256: None, object_id: None, md5: None,
+        });
+    }
+    Ok(items)
+}
+
 fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
     let (mut items, exports, unresolved) = match &source.backend {
         Backend::Rclone { remote } => {
@@ -928,26 +978,7 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
             command.args(["lsjson", remote, "--recursive", "--files-only",
                 "--checkers", "1", "--tpslimit", "2"]);
             let output = command_output_with_timeout(&mut command, listing_timeout)?;
-            let values: Vec<serde_json::Value> = serde_json::from_slice(&output)?;
-            let mut items = Vec::new();
-            for value in values {
-                let (Some(path), Some(size)) = (
-                    value.get("Path").and_then(|x| x.as_str()),
-                    value.get("Size").and_then(|x| x.as_u64())
-                ) else {
-                    bail!(
-                        "{} returned a file entry without a valid path and nonnegative size;                         refusing incomplete inventory",
-                        source.name
-                    );
-                };
-                // Identity is metadata, not a claim of end-to-end cryptographic verification.
-                let version = serde_json::to_string(&serde_json::json!({
-                    "modtime":value.get("ModTime"), "id":value.get("ID"),
-                    "hashes":value.get("Hashes")
-                }))?;
-                items.push(Item { path: path.into(), size, version, url: None,
-                    sha256: None, object_id: None, md5: None });
-            }
+            let items = parse_rclone_inventory(&output, &source.name)?;
             (items, Vec::new(), 0)
         }
         Backend::GoogleDriveIds { remote, .. } => {
