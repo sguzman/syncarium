@@ -51,4 +51,8 @@ destination = "/drive/icloud/photos/primary"
 # enabled = false
 # remote = "gdrive:"
 # token_file = "/home/YOUR_USER/.config/syncarium/google-access-token"
-# destination = "/drive/gdrive/.id-recovery"
+# destination = "/drive/gdrive-immutable-ids"
+
+# Destination paths are not allowed to nest beneath another source's
+# destination, even when that other source is disabled. This prevents accidental
+# overlap and preserves append-only archive safety.
