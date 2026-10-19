@@ -231,3 +231,43 @@ destination = "{}"
         "read-only planning must not create output folders");
     assert_eq!(invoke().stdout, first.stdout, "plans must be deterministic");
 }
+
+
+#[test]
+fn provider_listing_below_minimum_is_rejected_without_publishing_bytes() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("archive");
+    let dest = root.join("photos");
+    let source = temp.path().join("remote");
+    fs::create_dir_all(&dest).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("only-one.heic"), b"image").unwrap();
+    let config = temp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "photos"
+enabled = true
+kind = "rclone"
+remote = ":local:{}"
+destination = "{}"
+min_items = 2
+"#, root.display(), source.display(), dest.display()
+    )).unwrap();
+    let bin = env!("CARGO_BIN_EXE_syncarium");
+    let check = Command::new(bin)
+        .arg("--config").arg(&config).args(["run", "--execute"])
+        .output().unwrap();
+    assert!(!check.status.success());
+    assert!(String::from_utf8_lossy(&check.stderr).contains("min_items=2"));
+    assert!(!dest.join("only-one.heic").exists());
+    assert!(!root.join(".syncarium/inventories/photos.json").exists(),
+        "rejected inventory must never become a new baseline");
+}

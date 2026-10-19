@@ -90,6 +90,9 @@ struct Source {
     name: String,
     enabled: bool,
     destination: PathBuf,
+    /// Optional sanity floor on current *eligible* provider-listed file count.
+    #[serde(default)]
+    min_items: Option<usize>,
     #[serde(flatten)]
     backend: Backend,
 }
@@ -568,6 +571,10 @@ fn validate(cfg: &Config) -> Result<()> {
         ensure!(!s.name.is_empty() && s.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
             "source names require ASCII letters/digits/hyphens/underscores");
         ensure!(names.insert(s.name.clone()), "duplicate source name {}", s.name);
+        if let Some(minimum) = s.min_items {
+            ensure!((1..=10_000_000).contains(&minimum),
+                "source {} min_items must be 1..10000000", s.name);
+        }
         ensure!(s.destination.is_absolute(), "destination for {} must be absolute", s.name);
         clean_path(&s.destination)?;
         ensure!(s.destination.starts_with(&cfg.archive_root) && s.destination != cfg.archive_root,
@@ -759,6 +766,17 @@ fn eligible_google_objects(plan: drive_recovery::RecoveryPlan) -> (Vec<Item>, us
     (eligible, unresolved)
 }
 
+fn enforce_listing_floor(source: &Source, count: usize) -> Result<()> {
+    if let Some(minimum) = source.min_items {
+        ensure!(
+            count >= minimum,
+            "{} provider returned {} eligible items below configured min_items={minimum}; refusing incomplete inventory",
+            source.name, count
+        );
+    }
+    Ok(())
+}
+
 fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
     let (mut items, unresolved) = match &source.backend {
         Backend::Rclone { remote } => {
@@ -827,6 +845,7 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
                 "invalid MD5 for {}", item.path);
         }
     }
+    enforce_listing_floor(source, items.len())?;
     items.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Listing { files: items, unresolved })
 }
@@ -1354,6 +1373,7 @@ mod tests {
             name: "test".into(),
             enabled: true,
             destination: PathBuf::from("/tmp/test"),
+            min_items: None,
             backend: Backend::Rclone { remote: "none:".into() },
         };
         let mut pending = Pending {
@@ -1510,6 +1530,24 @@ mod tests {
         std::fs::write(&part, b"tampered!").unwrap();
         assert!(checkpoint(temp.path(), "fixture", &item, true).is_err());
         assert_eq!(std::fs::read(&part).unwrap(), b"tampered!");
+    }
+
+    #[test]
+    fn configured_inventory_floor_rejects_short_and_empty_listings() {
+        let source = Source {
+            name: "photos".into(),
+            enabled: true,
+            destination: PathBuf::from("/tmp/photos"),
+            min_items: Some(500),
+            backend: Backend::Rclone { remote: "photos:".into() },
+        };
+        assert!(enforce_listing_floor(&source, 0).is_err());
+        assert!(enforce_listing_floor(&source, 499).is_err());
+        assert!(enforce_listing_floor(&source, 500).is_ok());
+        assert!(enforce_listing_floor(&source, 700).is_ok());
+        // A deliberately unconfigured floor permits genuinely empty sources.
+        let relaxed = Source { min_items: None, ..source };
+        assert!(enforce_listing_floor(&relaxed, 0).is_ok());
     }
 
 }

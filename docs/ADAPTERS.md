@@ -82,3 +82,7 @@ Google object IDs are deliberately omitted from serialized recovery plans and lo
 ## Credential policy
 
 Google OAuth registration, consent screens, refresh tokens, callback servers, and automatic renewal are **out of scope by design**. For ordinary Google Drive use the existing authorized `gdrive:` rclone connection; rclone may manage its own token state. If authorization ceases to work, manual intervention is expected. For the experimental native Google ID adapter, `token_file` holds a **short-lived, manually supplied token**. This adapter must stay disabled in unattended schedules while manually renewed access tokens are the only available authorization mechanism. Credentials must never appear in a checked-in TOML file.
+
+## Optional inventory count floor
+
+Any `[[sources]]` entry can specify `min_items = 10000` (choose a threshold appropriate for **your own verified inventory**). If the current adapter reports fewer eligible file entries, Syncarium rejects the entire listing and declines to persist it or download from that source during the run. This is especially useful for large photo libraries vulnerable to unexpectedly truncated API listings. Leave the field absent for genuinely empty or newly created sources. An item floor does **not** prove completeness; it only detects some unusually small provider responses. For `google_drive_ids`, counts apply to eligible ID-selected binaries, not total Google account objects.

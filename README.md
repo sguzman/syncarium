@@ -91,3 +91,5 @@ Other already-authorized sources can continue within the same bandwidth budget. 
 - **Existing destination conflict protection:** completed paths must be regular files whose size matches the currently listed source item. Mismatched sizes, directories and symbolic links are preserved and flagged, not silently counted as archived or overwritten. A matching length is only a preliminary check, not a verified content hash.
 
 - **Power-loss hardening:** durable directory flushes for checkpoint renames and completed hard-link publication, plus safe automatic repair of empty partials left by an interrupted initial checkpoint write. Nonempty or ambiguous orphan state is preserved for investigation.
+
+- **Optional inventory sanity floors:** per-source `min_items` rejects implausibly short listings, useful when a provider temporarily omits thousands of photos. Thresholds are configured manually in private TOML after establishing a baseline.

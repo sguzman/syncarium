@@ -28,6 +28,8 @@ destination = "/drive/icloud/drive"
 name = "icloud-photos"
 kind = "rclone"
 enabled = false
+# Optional after confirming a baseline with read-only plan:
+# min_items = 10000
 remote = "icloudphotos:PrimarySync/All Photos"
 destination = "/drive/icloud/photos/primary"
 

@@ -98,3 +98,7 @@ When Syncarium reports `existing archived path held`, its destination already ex
 A zero-byte partial file left behind before its checkpoint was first created is now recovered automatically on the **next live executing run**; `plan` remains read-only. If the orphan partial contains any bytes, or only a JSON manifest survives, Syncarium stops that item and preserves both state and data for investigation. Previously committed chunks are verified on resumption; excess uncommitted bytes are truncated only in execute mode.
 
 Publishing now forces the completed destination directory entry to disk before the corresponding staged hard link and checkpoint are removed. Do not move or edit `/drive/.syncarium/partials` while a download is running. Interrupted state is supposed to survive a reboot so downloads can resume without starting over.
+
+## Guard against unexpectedly small cloud inventories
+
+After inspecting a known-good source listing, optionally set `min_items` on that source in local TOML (for example, a conservatively low bound for your iCloud Photos library). A later listing below the floor fails **before any state observation or transfers from that source**. The failure is reported in the ordinary source listing error path while other sources continue normally. Do not set a minimum larger than the number of eligible items the adapter actually returns, and do not mistake satisfying this threshold for a full media completeness audit. `plan` and `audit` also detect this condition without downloading files.
