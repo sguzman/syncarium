@@ -576,3 +576,93 @@ min_total_bytes = 1000
     assert!(!root.join(".syncarium/inventories/photos.json").exists(),
         "no observations should persist for rejected size inventories");
 }
+
+
+#[cfg(unix)]
+#[test]
+fn range_probe_offline_fixture_detects_ignored_offsets_and_overlong_chunks() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("archive");
+    let dest = root.join("photos");
+    let fake_bin = tmp.path().join("bin");
+    fs::create_dir_all(&dest).unwrap();
+    fs::create_dir_all(&fake_bin).unwrap();
+    let data_path = tmp.path().join("fake-remote-photo.heic");
+    let bytes: Vec<u8> = (0..150_000usize).map(|i| (i % 251) as u8).collect();
+    fs::write(&data_path, bytes).unwrap();
+
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "photos"
+kind = "rclone"
+enabled = false
+remote = "fake:"
+destination = "{}"
+"#, root.display(), dest.display())).unwrap();
+
+    let fake_rclone = fake_bin.join("rclone");
+    fs::write(&fake_rclone, r#"#!/bin/sh
+if [ "$1" = "lsjson" ]; then
+    printf '[{"Path":"private-original.heic","Size":150000,"ModTime":"2026-10-19T00:00:00Z"}]'
+elif [ "$1" = "cat" ]; then
+    shift
+    shift
+    off=0
+    cnt=0
+    while [ "$#" -gt 1 ]; do
+        case "$1" in
+            --offset) off="$2" ;;
+            --count) cnt="$2" ;;
+        esac
+        shift
+        shift
+    done
+    if [ "$SYNCARIUM_PROBE_MODE" = "ignored-offset" ]; then off=0; fi
+    if [ "$SYNCARIUM_PROBE_MODE" = "overlong" ]; then cnt=$((cnt+1)); fi
+    dd if="$SYNCARIUM_PROBE_DATA" bs=1 skip="$off" count="$cnt" status=none
+else
+    exit 17
+fi
+"#).unwrap();
+    fs::set_permissions(&fake_rclone, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let probe = |mode: &str, execute: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_syncarium"));
+        cmd.arg("--config").arg(&config)
+            .args(["probe-range", "--source", "photos"]);
+        if execute { cmd.arg("--execute"); }
+        cmd.env("PATH", format!("{}:{}", fake_bin.display(),
+            std::env::var("PATH").unwrap_or_default()))
+            .env("SYNCARIUM_PROBE_DATA", &data_path)
+            .env("SYNCARIUM_PROBE_MODE", mode)
+            .output().unwrap()
+    };
+    let preview = probe("ignored-offset", false);
+    assert!(preview.status.success());
+    assert!(String::from_utf8_lossy(&preview.stdout).contains("PREVIEW ONLY"));
+
+    let good = probe("correct", true);
+    assert!(good.status.success(), "{}",
+        String::from_utf8_lossy(&good.stderr));
+    assert!(String::from_utf8_lossy(&good.stdout).contains("192 KiB"));
+    let wrong = probe("ignored-offset", true);
+    assert!(!wrong.status.success(), "ignoring offsets must fail");
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains("range offsets"));
+    let overlong = probe("overlong", true);
+    assert!(!overlong.status.success(), "overlong read must fail");
+    assert!(String::from_utf8_lossy(&overlong.stderr).contains("more bytes"));
+    assert!(!root.join(".syncarium").exists(),
+        "diagnostic must not record cloud state or archive checkpoints");
+    assert!(!dest.join("private-original.heic").exists(),
+        "diagnostic must never publish a remote photo");
+}
