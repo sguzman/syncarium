@@ -66,15 +66,15 @@ fn recognize(header: &[u8]) -> Option<Signature> {
         if box_size >= 16 {
             let brands = &header[..header.len().min(box_size)];
             if [b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis"]
-                .iter().any(|brand| iso_brand(brands, *brand))
+                .iter().any(|brand| iso_brand(brands, brand))
             {
                 return Some(Signature::Heif);
             }
-            if [b"avif", b"avis"].iter().any(|brand| iso_brand(brands, *brand)) {
+            if [b"avif", b"avis"].iter().any(|brand| iso_brand(brands, brand)) {
                 return Some(Signature::Avif);
             }
             if [b"qt  ", b"isom", b"iso2", b"iso5", b"mp41", b"mp42", b"M4V "]
-                .iter().any(|brand| iso_brand(brands, *brand))
+                .iter().any(|brand| iso_brand(brands, brand))
             {
                 return Some(Signature::IsoVideo);
             }
