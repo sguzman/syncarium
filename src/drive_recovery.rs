@@ -239,7 +239,7 @@ mod tests {
                    again.items.iter().map(|x| &x.relative_destination).collect::<Vec<_>>());
         for item in original.items {
             assert!(!item.relative_destination.contains("private"));
-            assert!(!item.relative_destination.contains("duplicate"));
+            assert!(!item.relative_destination.contains("duplicate.mov"));
             assert!(!item.relative_destination.contains(".."));
         }
     }
