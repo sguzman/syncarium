@@ -454,7 +454,7 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
                     &cfg.archive_root,
                     &source.name,
                     items.iter().map(|item| item.path.as_str())
-                        .chain(exports.iter().map(|item| item.relative_destination.as_str())),
+                        .chain(exports.iter().map(|item| item.object_fingerprint.as_str())),
                     false,
                 ) {
                     Ok(observation) => {
@@ -1428,7 +1428,7 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
             &cfg.archive_root,
             &source.name,
             items.iter().map(|item| item.path.as_str())
-                .chain(exports.iter().map(|item| item.relative_destination.as_str())),
+                .chain(exports.iter().map(|item| item.object_fingerprint.as_str())),
             execute,
         ) {
             Ok(result) => result,

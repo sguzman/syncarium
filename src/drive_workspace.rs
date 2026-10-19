@@ -90,13 +90,21 @@ pub(crate) fn plan(raw: &[u8]) -> Result<ExportPlan> {
             "duplicate Google object ID; refusing incomplete workspace plan");
         if let Some((mime, extension)) = format_for_type(&obj.mime_type) {
             let hash = hex::encode(Sha256::digest(obj.id.as_bytes()));
+            // Version-qualified publication retains prior Google revisions;
+            // the inventory still tracks the stable object ID separately.
+            let mut revision = Sha256::new();
+            revision.update(obj.id.as_bytes());
+            revision.update([0]);
+            revision.update(obj.modified_time.as_deref().unwrap_or("").as_bytes());
+            let revision_hash = hex::encode(revision.finalize());
             supported.push(ExportCandidate {
                 object_id: obj.id,
                 source_version_known: obj.modified_time.is_some(),
                 source_version: obj.modified_time,
                 object_fingerprint: hash.clone(),
                 relative_destination: format!(
-                    "workspace-exports/{}/id-{hash}{extension}", &hash[..2]
+                    "workspace-exports/{}/id-{hash}-rev-{}{extension}",
+                    &hash[..2], &revision_hash[..16]
                 ),
                 source_mime: obj.mime_type,
                 export_mime: mime,
@@ -410,6 +418,30 @@ mod tests {
             br#"{"mimeType":"application/vnd.google-apps.document"}"#,
             "application/vnd.google-apps.document", "2026-10-19T00:00:00.000Z"
         ).is_err());
+    }
+
+    #[test]
+    fn new_document_revision_has_distinct_archive_path_without_exposing_time() {
+        fn single(time: &str) -> ExportPlan {
+            let content = serde_json::json!([{
+                "id":"private-google-object-id",
+                "name":"family-budget",
+                "mimeType":"application/vnd.google-apps.spreadsheet",
+                "modifiedTime":time
+            }]);
+            plan(&serde_json::to_vec(&content).unwrap()).unwrap()
+        }
+        let old = single("2026-10-01T00:00:00Z");
+        let edited = single("2026-10-19T00:00:00Z");
+        assert_eq!(old.supported[0].object_fingerprint,
+                   edited.supported[0].object_fingerprint);
+        assert_ne!(old.supported[0].relative_destination,
+                   edited.supported[0].relative_destination);
+        for item in [&old.supported[0], &edited.supported[0]] {
+            assert!(!item.relative_destination.contains("family-budget"));
+            assert!(!item.relative_destination.contains("2026"));
+            assert!(item.relative_destination.ends_with(".xlsx"));
+        }
     }
 
 }
