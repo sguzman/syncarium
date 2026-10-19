@@ -19,16 +19,28 @@ struct Object {
     parents: Vec<String>,
     #[serde(default)]
     size: Option<serde_json::Value>,
+    #[serde(default)]
+    md5_checksum: Option<String>,
+    #[serde(default)]
+    modified_time: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct RecoveryItem {
+    /// Present only in memory; NEVER serialize an account's cloud object IDs.
+    #[serde(skip_serializing)]
+    pub(crate) object_id: String,
+    /// Source MD5 is used for verifying final bytes; absent for Workspace exports.
+    #[serde(skip_serializing)]
+    pub(crate) md5: Option<String>,
+    #[serde(skip_serializing)]
+    pub(crate) version: String,
     /// SHA-256 of the immutable cloud object ID, not of its payload.
     object_fingerprint: String,
     /// Relative to configured source destination. No original names exposed.
-    relative_destination: String,
+    pub(crate) relative_destination: String,
     reason: &'static str,
-    source_size: Option<u64>,
+    pub(crate) source_size: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -175,7 +187,16 @@ pub(crate) fn plan_recovery_json(raw: &[u8]) -> Result<RecoveryPlan> {
         let relative_destination = format!(
             ".rclone-duplicates/objects/{}/id-{hash}{extension}", &hash[..2]
         );
+        let md5 = obj.md5_checksum.as_ref()
+            .filter(|md5| md5.len() == 32 && md5.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(|md5| md5.to_ascii_lowercase());
+        let version = format!("id={};mtime={};md5={};size={:?}",
+            hash, obj.modified_time.as_deref().unwrap_or(""),
+            md5.as_deref().unwrap_or(""), size);
         items.push(RecoveryItem {
+            object_id: id,
+            md5,
+            version,
             object_fingerprint: hash,
             relative_destination,
             reason: if colliding_file_ids.contains(&id) {
@@ -255,4 +276,17 @@ mod tests {
             br#"[{"id":"x","name":"a","mimeType":"text/plain"},{"id":"x","name":"b","mimeType":"text/plain"}]"#
         ).is_err());
     }
+    #[test]
+    fn plan_json_never_exposes_cloud_object_ids() {
+        let json = serde_json::json!([
+            {"id":"super-private-google-id-A","name":"file.bin","mimeType":"application/octet-stream","parents":["root"],"size":10,"md5Checksum":"900150983cd24fb0d6963f7d28e17f72"},
+            {"id":"super-private-google-id-B","name":"file.bin","mimeType":"application/octet-stream","parents":["root"],"size":20}
+        ]);
+        let plan = plan_recovery_json(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(plan.items[0].object_id.len(), "super-private-google-id-A".len());
+        let serialized = serde_json::to_string(&plan).unwrap();
+        assert!(!serialized.contains("super-private-google-id-"));
+        assert!(!serialized.contains("900150983cd24fb0d6963f7d28e17f72"));
+    }
+
 }
