@@ -64,8 +64,14 @@ destination = "{}"
                 "status: {}", String::from_utf8_lossy(&status.stderr));
             let progress: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
             assert_eq!(progress["partial_files"], 1);
-            assert_eq!(progress["sources"][0]["committed_bytes"],
-                (attempt as u64 + 1) * 1024 * 1024);
+            // Beginning with the second run, a 64 KiB remote overlap
+            // validation consumes part of that run's 1 MiB payload budget.
+            let committed = if attempt == 0 {
+                1024 * 1024
+            } else {
+                2 * 1024 * 1024 - 64 * 1024
+            };
+            assert_eq!(progress["sources"][0]["committed_bytes"], committed);
         }
     }
     assert_eq!(fs::read(dest.join("large.bin")).unwrap(), payload);
