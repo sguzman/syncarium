@@ -24,6 +24,9 @@ struct Receipt {
     size: u64,
     source_version: String,
     sha256: String,
+    /// A prepared receipt is not yet proof of completed hard-link publication.
+    #[serde(default)]
+    published: bool,
 }
 
 #[derive(Default, Serialize)]
@@ -103,12 +106,16 @@ pub(crate) fn record(
     let new = Receipt {
         format: FORMAT, source: source.into(), path: relative.into(),
         size, source_version: source_version.into(), sha256: sha256.into(),
+        published: false,
     };
     let path = receipt_path(root, source, relative);
     no_symlink_ancestors(&path)?;
     if path.exists() {
-        let recorded: Receipt = serde_json::from_slice(&fs::read(&path)?)
+        let mut recorded: Receipt = serde_json::from_slice(&fs::read(&path)?)
             .context("reading existing immutable archive receipt")?;
+        // Publication can transition only from prepared to published.
+        // It must never alter original content identity or source revision.
+        recorded.published = false;
         ensure!(recorded == new,
             "archive receipt identity or content changed; preserve local state for review");
         return Ok(());
@@ -127,6 +134,37 @@ pub(crate) fn record(
     Ok(())
 }
 
+/// The sole legal mutation of a completed receipt: prepared -> published.
+/// A successful final hard link must already have been synced to disk.
+pub(crate) fn mark_published(
+    root: &Path,
+    source: &str,
+    relative: &str,
+    source_version: &str,
+    size: u64,
+    sha256: &str,
+) -> Result<()> {
+    let path = receipt_path(root, source, relative);
+    no_symlink_ancestors(&path)?;
+    let mut existing: Receipt = serde_json::from_slice(&fs::read(&path)?)?;
+    ensure!(existing.format == FORMAT && existing.source == source
+        && existing.path == relative && existing.source_version == source_version
+        && existing.size == size && existing.sha256 == sha256,
+        "cannot finalize unrelated or mismatched archive receipt");
+    if existing.published {
+        return Ok(());
+    }
+    existing.published = true;
+    let parent = path.parent().context("receipt directory missing")?;
+    let mut staging = NamedTempFile::new_in(parent)?;
+    serde_json::to_writer(&mut staging, &existing)?;
+    staging.flush()?;
+    staging.as_file().sync_all()?;
+    staging.persist(&path)
+        .map_err(|err| anyhow!("cannot finalize publication receipt: {}", err.error))?;
+    sync_directory(parent)
+}
+
 /// Workspace outputs must have a receipt from this source revision. A local
 /// file with no receipt or an old revision is a conflict, not a success.
 /// Rehashing is intentionally left to the explicit disk-wide verify command.
@@ -136,6 +174,7 @@ pub(crate) fn check_export_target(
     relative: &str,
     source_version: &str,
     target: &Path,
+    reconcile: bool,
 ) -> Result<()> {
     ensure!(!source_version.is_empty(), "Workspace source revision not recorded");
     safe_relative(relative)?;
@@ -151,6 +190,17 @@ pub(crate) fn check_export_target(
         "Workspace revision changed or receipt does not match");
     ensure!(record.size == metadata.len(),
         "Workspace output size differs from receipt");
+    if !record.published {
+        // This can occur after a crash between creating a receipt and
+        // linking the destination. A same-sized unrelated file must NEVER
+        // be mistaken for a successfully archived Google export.
+        let hash = fingerprint_file(target, None, None)?;
+        ensure!(hash == record.sha256,
+            "unfinalized Workspace receipt does not match archived bytes");
+        if reconcile {
+            mark_published(root, source, relative, source_version, record.size, &hash)?;
+        }
+    }
     Ok(())
 }
 
@@ -257,6 +307,39 @@ pub(crate) fn verify(cfg: &Config, selected: Option<&str>, json: bool) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_workspace_receipt_never_certifies_an_unrelated_same_size_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let relative = "workspace-exports/aa/locked.docx";
+        let source = "workspace";
+        let target = tmp.path().join("archive.docx");
+        let correct = hex::encode(Sha256::digest(b"first"));
+        record(tmp.path(), source, relative, "revision-1", 5, &correct).unwrap();
+        fs::write(&target, b"other").unwrap();
+        assert!(check_export_target(tmp.path(), source, relative,
+            "revision-1", &target, true).is_err());
+        // Failed reconciliation may neither rewrite the wrong file nor
+        // certify the prepared receipt.
+        assert_eq!(fs::read(&target).unwrap(), b"other");
+        let stored: Receipt = serde_json::from_slice(
+            &fs::read(receipt_path(tmp.path(), source, relative)).unwrap()).unwrap();
+        assert!(!stored.published);
+
+        fs::write(&target, b"first").unwrap();
+        check_export_target(tmp.path(), source, relative, "revision-1", &target, false)
+            .unwrap();
+        let stored: Receipt = serde_json::from_slice(
+            &fs::read(receipt_path(tmp.path(), source, relative)).unwrap()).unwrap();
+        assert!(!stored.published, "read-only inspection must not alter receipt");
+        check_export_target(tmp.path(), source, relative, "revision-1", &target, true)
+            .unwrap();
+        let stored: Receipt = serde_json::from_slice(
+            &fs::read(receipt_path(tmp.path(), source, relative)).unwrap()).unwrap();
+        assert!(stored.published);
+        record(tmp.path(), source, relative, "revision-1", 5, &correct).unwrap();
+        assert!(record(tmp.path(), source, relative, "revision-2", 5, &correct).is_err());
+    }
 
     #[test]
     fn immutable_receipt_can_be_reused_but_never_replaced() {

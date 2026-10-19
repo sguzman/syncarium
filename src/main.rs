@@ -479,7 +479,7 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
                         if receipts::check_export_target(
                             &cfg.archive_root, &source.name,
                             &candidate.relative_destination, candidate.version_key(),
-                            &target
+                            &target, false
                         ).is_err() {
                             row.held_files += 1;
                         }
@@ -1135,6 +1135,9 @@ fn publish(
     match fs::hard_link(part, &target) {
         Ok(()) => {
             sync_directory(target.parent().context("missing target parent")?)?;
+            receipts::mark_published(
+                archive_root, source, &item.path, &item.version, item.size, &sha256
+            )?;
             fs::remove_file(part)?;
             if let Some(meta) = meta {
                 fs::remove_file(meta)?;
@@ -1192,6 +1195,9 @@ fn reconcile_published(
         &part, item.md5.as_deref(), item.sha256.as_deref(),
     )?;
     receipts::record(root, source, &item.path, &item.version, item.size, &sha256)?;
+    receipts::mark_published(
+        root, source, &item.path, &item.version, item.size, &sha256
+    )?;
     fs::remove_file(&part)?;
     fs::remove_file(&meta)?;
     sync_directory(part.parent().context("missing staging directory")?)?;
@@ -1498,7 +1504,8 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
             if target.exists() {
                 if let Err(error) = receipts::check_export_target(
                     &cfg.archive_root, &source.name,
-                    &candidate.relative_destination, candidate.version_key(), &target
+                    &candidate.relative_destination, candidate.version_key(), &target,
+                    execute
                 ) {
                     let message = format!(
                         "{}: existing Workspace export held for {}: {error:#}",
@@ -1941,7 +1948,7 @@ mod tests {
         receipts::check_export_target(
             &root, "workspace",
             pending.exports[0].relative_destination.as_str(),
-            pending.exports[0].version_key(), &target
+            pending.exports[0].version_key(), &target, false
         ).unwrap();
     }
 
