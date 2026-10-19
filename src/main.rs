@@ -433,7 +433,7 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
     let _lock = if execute {
         fs::create_dir_all(&state_root)?;
         no_symlink_ancestors(&state_root)?;
-        let handle = OpenOptions::new().create(true).read(true).write(true)
+        let handle = OpenOptions::new().create(true).truncate(false).read(true).write(true)
             .open(state_root.join("run.lock"))?;
         handle.try_lock_exclusive().context("another Syncarium run is active")?;
         Some(handle)
