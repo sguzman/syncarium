@@ -1027,6 +1027,55 @@ fn publish(
     Ok(())
 }
 
+/// Complete an interrupted successful hard-link publication, without
+/// deleting an unrelated local file of the same name or size. Ordinary legacy
+/// archive files without staging state are left entirely untouched.
+fn reconcile_published(
+    root: &Path,
+    source: &str,
+    item: &Item,
+    target: &Path,
+    execute: bool,
+) -> Result<()> {
+    if !execute {
+        return Ok(());
+    }
+    let (part, meta) = state_file(root, source, item);
+    no_symlink_ancestors(&part)?;
+    no_symlink_ancestors(&meta)?;
+    let part_exists = part.exists();
+    let meta_exists = meta.exists();
+    if !part_exists && !meta_exists {
+        return Ok(());
+    }
+    ensure!(part_exists && meta_exists,
+        "inconsistent old staging state for published path; preserving for review");
+    let (checkpoint, _, _) = checkpoint(root, source, item, false)?;
+    ensure!(checkpoint.committed == item.size,
+        "published path conflicts with incomplete staged item; preserving state");
+    let staged = fs::symlink_metadata(&part)?;
+    let final_file = fs::symlink_metadata(target)?;
+    ensure!(staged.file_type().is_file() && final_file.file_type().is_file(),
+        "published path or staging data is not an ordinary file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(staged.dev() == final_file.dev() && staged.ino() == final_file.ino(),
+            "published path and partial are different files; refusing cleanup");
+    }
+    #[cfg(not(unix))]
+    bail!("hard-link identity reconciliation is only supported on Unix");
+    let sha256 = receipts::fingerprint_file(
+        &part, item.md5.as_deref(), item.sha256.as_deref(),
+    )?;
+    receipts::record(root, source, &item.path, &item.version, item.size, &sha256)?;
+    fs::remove_file(&part)?;
+    fs::remove_file(&meta)?;
+    sync_directory(part.parent().context("missing staging directory")?)?;
+    println!("RECOVERED interrupted publication for {}", item.path);
+    Ok(())
+}
+
 /// Advance at most one chunk of a source. A failure stays confined to this
 /// source for this pass, while other healthy providers get their turn.
 fn advance_source(
@@ -1044,6 +1093,7 @@ fn advance_source(
     let relative = safe_relative(&item.path)?;
     let target = pending.source.destination.join(relative);
     if destination_already_archived(&target, item)? {
+        reconcile_published(&cfg.archive_root, &pending.source.name, item, &target, true)?;
         pending.index += 1;
         return Ok(true);
     }
@@ -1192,7 +1242,19 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
         for item in items {
             let target = source.destination.join(safe_relative(&item.path)?);
             match destination_already_archived(&target, &item) {
-                Ok(true) => continue,
+                Ok(true) => {
+                    if let Err(error) = reconcile_published(
+                        &cfg.archive_root, &source.name, &item, &target, execute
+                    ) {
+                        let message = format!(
+                            "{}: published path has unresolved staged state for {}: {error:#}",
+                            source.name, item.path
+                        );
+                        eprintln!("ITEM HELD: {message}");
+                        issues.push(message);
+                    }
+                    continue;
+                },
                 Ok(false) => {}
                 Err(error) => {
                     let message = format!(
@@ -1545,6 +1607,56 @@ mod tests {
         // A deliberately unconfigured floor permits genuinely empty sources.
         let relaxed = Source { min_items: None, ..source };
         assert!(enforce_listing_floor(&relaxed, 0).is_ok());
+    }
+
+    #[test]
+    fn completed_hard_link_interrupted_before_cleanup_is_reconciled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destination = tmp.path().join("archive");
+        std::fs::create_dir(&destination).unwrap();
+        let item = Item {
+            path: "result.bin".into(), size: 8, version: "v1".into(),
+            url: None, sha256: None, object_id: None, md5: None,
+        };
+        let (mut cp, part, meta) =
+            checkpoint(tmp.path(), "fixture", &item, true).unwrap();
+        let chunk = tmp.path().join("chunk");
+        std::fs::write(&chunk, b"complete").unwrap();
+        store_chunk(&part, &meta, &mut cp, &chunk).unwrap();
+        let sha = receipts::fingerprint_file(&part, None, None).unwrap();
+        receipts::record(tmp.path(), "fixture", &item.path, &item.version, item.size, &sha).unwrap();
+        let target = destination.join(&item.path);
+        std::fs::hard_link(&part, &target).unwrap();
+
+        reconcile_published(tmp.path(), "fixture", &item, &target, false).unwrap();
+        assert!(part.exists(), "read-only operations must not clean up staging");
+
+        reconcile_published(tmp.path(), "fixture", &item, &target, true).unwrap();
+        assert_eq!(std::fs::read(target).unwrap(), b"complete");
+        assert!(!part.exists());
+        assert!(!meta.exists());
+    }
+
+    #[test]
+    fn different_inode_at_existing_target_never_destroys_staging_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destination = tmp.path().join("archive");
+        std::fs::create_dir(&destination).unwrap();
+        let item = Item {
+            path: "same-size.bin".into(), size: 8, version: "v1".into(),
+            url: None, sha256: None, object_id: None, md5: None,
+        };
+        let (mut cp, part, meta) =
+            checkpoint(tmp.path(), "fixture", &item, true).unwrap();
+        let chunk = tmp.path().join("chunk");
+        std::fs::write(&chunk, b"original").unwrap();
+        store_chunk(&part, &meta, &mut cp, &chunk).unwrap();
+        let target = destination.join(&item.path);
+        std::fs::write(&target, b"otherone").unwrap();
+        assert!(reconcile_published(tmp.path(), "fixture", &item, &target, true).is_err());
+        assert_eq!(std::fs::read(&part).unwrap(), b"original");
+        assert_eq!(std::fs::read(&target).unwrap(), b"otherone");
+        assert!(meta.exists());
     }
 
 }
