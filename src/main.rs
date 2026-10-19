@@ -241,6 +241,8 @@ struct Pending {
     index: usize,
     exports: Vec<drive_workspace::ExportCandidate>,
     export_index: usize,
+    /// Index of the staged item whose remote tail was checked in this pass.
+    resume_checked_index: Option<usize>,
     consecutive_failures: u8,
     circuit_open: bool,
 }
@@ -1397,6 +1399,37 @@ where
     Ok(true)
 }
 
+const RESUME_OVERLAP_BYTES: u64 = 64 * 1024;
+
+/// Compare a small previously committed region with the current provider
+/// bytes. Local checkpoint hashing alone cannot detect changed cloud content
+/// when the provider reuses the same version metadata.
+fn check_remote_resume_tail(
+    source: &Source,
+    item: &Item,
+    checkpoint: &Checkpoint,
+    part: &Path,
+    rate_kib: u64,
+    deadline: Duration,
+) -> Result<()> {
+    ensure!(checkpoint.committed > 0 && checkpoint.last_size > 0,
+        "incomplete resume checkpoint has no verified tail");
+    let length = checkpoint.last_size.min(RESUME_OVERLAP_BYTES);
+    let offset = checkpoint.committed.checked_sub(length)
+        .context("invalid committed offset for remote overlap")?;
+    let mut local = File::open(part)?;
+    local.seek(SeekFrom::Start(offset))?;
+    let mut expected = vec![0u8; length as usize];
+    local.read_exact(&mut expected)?;
+    let parent = part.parent().context("missing staging parent")?;
+    let scratch = NamedTempFile::new_in(parent)?;
+    download_range(source, item, offset, length, rate_kib, deadline, scratch.path())?;
+    let actual = fs::read(scratch.path())?;
+    ensure!(actual == expected,
+        "remote resume overlap differs from saved bytes; preserving partial for review");
+    Ok(())
+}
+
 fn advance_source(
     cfg: &Config,
     pending: &mut Pending,
@@ -1425,6 +1458,27 @@ fn advance_source(
     }
     let (mut cp, part, meta) =
         checkpoint(&cfg.archive_root, &pending.source.name, item, true)?;
+    if cp.committed > 0 && pending.resume_checked_index != Some(pending.index) {
+        let size = cp.last_size.min(RESUME_OVERLAP_BYTES);
+        ensure!(size > 0, "staged bytes exist without a complete last-chunk checkpoint");
+        let time_bytes = cfg.scheduler.bandwidth_kib.saturating_mul(1024)
+            .saturating_mul(remaining.as_secs().saturating_sub(4));
+        // A verification request consumes the SAME budget as ordinary data.
+        // If the configured pass cannot afford it, postpone the item instead
+        // of silently accepting the incomplete consistency check.
+        if *budget < size || time_bytes < size {
+            return Ok(false);
+        }
+        *budget -= size;
+        check_remote_resume_tail(
+            &pending.source, item, &cp, &part, cfg.scheduler.bandwidth_kib,
+            remaining.saturating_sub(Duration::from_secs(2)),
+        )?;
+        pending.resume_checked_index = Some(pending.index);
+        println!("RESUME CHECK {} {} verified {} remote bytes",
+            pending.source.name, item.path, size);
+        return Ok(true);
+    }
     if cp.committed == item.size {
         publish(
             &cfg.archive_root, &pending.source.name,
@@ -1656,6 +1710,7 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
             index: 0,
             exports: export_queue,
             export_index: 0,
+            resume_checked_index: None,
             consecutive_failures: 0,
             circuit_open: false,
         });
@@ -1824,6 +1879,7 @@ mod tests {
             index: 0,
             exports: Vec::new(),
             export_index: 0,
+            resume_checked_index: None,
             consecutive_failures: 0,
             circuit_open: false,
         };
@@ -2060,6 +2116,7 @@ mod tests {
         let mut pending = Pending {
             source, files: Vec::new(), index: 0,
             exports: vec![candidate], export_index: 0,
+            resume_checked_index: None,
             consecutive_failures: 0, circuit_open: false,
         };
         let mut budget = 12 * 1024 * 1024;
@@ -2119,6 +2176,7 @@ mod tests {
         let mut pending = Pending {
             source: cfg.sources[0].clone(), files: Vec::new(), index: 0,
             exports: vec![candidate], export_index: 0,
+            resume_checked_index: None,
             consecutive_failures: 0, circuit_open: false,
         };
         let mut budget = 12 * 1024 * 1024;
