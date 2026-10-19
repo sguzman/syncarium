@@ -1,8 +1,8 @@
 //! Google Workspace export planning and strictly bounded whole-file reader.
 //!
 //! Workspace exports are generally NOT resumable byte-range blobs. The
-//! planner is read-only. The HTTP reader is intentionally not registered as
-//! an unattended scheduler adapter until source-version pinning is validated.
+//! planner is read-only. The whole-file export adapter is opt-in and must
+//! verify source revision metadata before AND after the export.
 use anyhow::{ensure, Context, Result};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
@@ -137,20 +137,84 @@ pub(crate) struct ExportLimits {
     pub(crate) deadline: Duration,
 }
 
-/// This primitive is NOT part of unattended scheduling. The operator supplies
-/// a private, short-lived token file; Syncarium never refreshes it.
-#[allow(dead_code)]
+/// A manually supplied short-lived token is required; never renewed here.
+/// Re-check source MIME and modification metadata around the export.
 pub(crate) fn export_small(
     token_file: &Path,
     item: &ExportCandidate,
     staging: &Path,
     limits: ExportLimits,
 ) -> Result<u64> {
+    ensure!(!item.version_key().is_empty(),
+        "cannot export an item without source modification metadata");
     let token = crate::drive_id::read_token(token_file)?;
-    stream_export(
+    let started = Instant::now();
+    assert_current_revision(&token, item, limits.deadline.min(Duration::from_secs(10)))?;
+    let time_left = limits.deadline.saturating_sub(started.elapsed());
+    ensure!(time_left > Duration::from_secs(2),
+        "no time remaining for bounded Workspace export");
+    let length = stream_export(
         &token, export_url(&item.object_id, item.export_mime)?,
-        item.export_mime, staging, limits,
-    )
+        item.export_mime, staging,
+        ExportLimits { deadline: time_left.saturating_sub(Duration::from_secs(1)), ..limits },
+    )?;
+    // An export from a mutable Google Doc is acceptable only when its source
+    // metadata still agrees after the response has been completely staged.
+    let time_left = limits.deadline.saturating_sub(started.elapsed());
+    assert_current_revision(&token, item, time_left.min(Duration::from_secs(10)))?;
+    Ok(length)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentVersion {
+    modified_time: Option<String>,
+    mime_type: Option<String>,
+}
+
+fn matches_expected_revision(
+    raw: &[u8],
+    expected_mime: &str,
+    expected_modified: &str,
+) -> Result<()> {
+    let current: CurrentVersion = serde_json::from_slice(raw)?;
+    ensure!(current.mime_type.as_deref() == Some(expected_mime),
+        "Google Workspace source MIME type changed during export");
+    ensure!(current.modified_time.as_deref() == Some(expected_modified),
+        "Google Workspace document changed during export");
+    Ok(())
+}
+
+/// Small, fixed-field metadata GET. Only the strict request's success/failure
+/// escapes: never print HTTP error objects that may contain private Google IDs.
+fn assert_current_revision(
+    token: &str,
+    item: &ExportCandidate,
+    deadline: Duration,
+) -> Result<()> {
+    ensure!(deadline > Duration::ZERO, "Workspace metadata check timed out");
+    let mut url = Url::parse("https://www.googleapis.com/drive/v3/files")?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("invalid Drive metadata path"))?
+        .push(&item.object_id);
+    url.query_pairs_mut().append_pair("fields", "modifiedTime,mimeType");
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(deadline)
+        .build()?;
+    let response = client.get(url).bearer_auth(token)
+        .send().map_err(|_| anyhow::anyhow!("Google Workspace metadata check failed"))?;
+    ensure!(response.status().as_u16() == 200,
+        "Google Workspace source revision unavailable (HTTP {})",
+        response.status().as_u16());
+    // Limit even malformed metadata responses to a few KiB.
+    let mut limited = response.take(16 * 1024 + 1);
+    let mut body = Vec::new();
+    limited.read_to_end(&mut body)
+        .map_err(|_| anyhow::anyhow!("Google Workspace metadata could not be read"))?;
+    ensure!(body.len() <= 16 * 1024,
+        "unexpectedly large Google Workspace metadata response");
+    matches_expected_revision(&body, &item.source_mime, item.version_key())
 }
 
 /// Guard whole-file exports against overrunning a source-independent budget.
@@ -330,4 +394,22 @@ mod tests {
         assert!(redirect.is_err());
         assert!(staged.is_empty());
     }
+    #[test]
+    fn metadata_checks_reject_mutable_or_incomplete_workspace_objects() {
+        let ok = br#"{"modifiedTime":"2026-10-19T00:00:00.000Z","mimeType":"application/vnd.google-apps.document"}"#;
+        assert!(matches_expected_revision(
+            ok, "application/vnd.google-apps.document", "2026-10-19T00:00:00.000Z"
+        ).is_ok());
+        assert!(matches_expected_revision(
+            ok, "application/vnd.google-apps.spreadsheet", "2026-10-19T00:00:00.000Z"
+        ).is_err());
+        assert!(matches_expected_revision(
+            ok, "application/vnd.google-apps.document", "2026-10-18T00:00:00.000Z"
+        ).is_err());
+        assert!(matches_expected_revision(
+            br#"{"mimeType":"application/vnd.google-apps.document"}"#,
+            "application/vnd.google-apps.document", "2026-10-19T00:00:00.000Z"
+        ).is_err());
+    }
+
 }
