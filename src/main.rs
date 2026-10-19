@@ -704,6 +704,34 @@ fn checkpoint(root: &Path, source: &str, item: &Item, create: bool)
     }
     Ok((cp, part, meta))
 }
+/// Partition immutable Google object ID candidates into verified ranged-transfer
+/// inputs and unresolved entries that require a separate export pathway.
+fn eligible_google_objects(plan: drive_recovery::RecoveryPlan) -> (Vec<Item>, usize) {
+    let total = plan.items.len();
+    let unsupported = plan.unsupported;
+    let eligible: Vec<Item> = plan
+        .items
+        .into_iter()
+        .filter_map(|item| {
+            // Only files with provider-confirmed size AND MD5 may use the
+            // native range adapter. Do not infer unknown Google Docs sizes.
+            match (item.source_size, item.md5) {
+                (Some(size), Some(md5)) => Some(Item {
+                    path: item.relative_destination,
+                    size,
+                    version: item.version,
+                    url: None,
+                    sha256: None,
+                    object_id: Some(item.object_id),
+                    md5: Some(md5),
+                }),
+                _ => None,
+            }
+        })
+        .collect();
+    (eligible, total - eligible.len() + unsupported)
+}
+
 fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
     let (mut items, unresolved) = match &source.backend {
         Backend::Rclone { remote } => {
@@ -742,25 +770,7 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
             ensure!(raw.len() <= 256 * 1024 * 1024,
                 "Google Drive ID listing exceeds 256 MiB limit");
             let plan = drive_recovery::plan_recovery_json(&raw)?;
-            let total_candidates = plan.items.len();
-            let unsupported = plan.unsupported;
-            let eligible: Vec<Item> = plan.items.into_iter().filter_map(|item| {
-                // A native byte-range reader needs exact size and a source
-                // checksum. Google Docs exports do not provide either.
-                match (item.source_size, item.md5) {
-                    (Some(size), Some(md5)) =>
-                        Some(Item {
-                            path: item.relative_destination, size,
-                            version: item.version, url: None, sha256: None,
-                            object_id: Some(item.object_id), md5: Some(md5),
-                        }),
-                    _ => None,
-                }
-            }).collect();
-            // Skip count includes unsupported native formats, unknown export
-            // sizes, and binaries lacking usable provider MD5 checksums.
-            let unresolved = total_candidates - eligible.len() + unsupported;
-            (eligible, unresolved)
+            eligible_google_objects(plan)
         }
         Backend::HttpManifest { manifest } => {
             no_symlink_ancestors(manifest)?;
@@ -1306,5 +1316,21 @@ mod tests {
         assert_eq!(pending.index, 3);
         assert!(pending.circuit_open);
     }
+
+    #[test]
+    fn native_google_listing_reports_unknown_size_hash_and_shortcut_gaps() {
+        let raw = serde_json::to_vec(&serde_json::json!([
+            {"id":"good","name":"same.bin","mimeType":"application/octet-stream","parents":["root"],"size":"12","md5Checksum":"900150983cd24fb0d6963f7d28e17f72"},
+            {"id":"no-hash","name":"same.bin","mimeType":"application/octet-stream","parents":["root"],"size":"12"},
+            {"id":"google-doc","name":"same.bin","mimeType":"application/vnd.google-apps.document","parents":["root"]},
+            {"id":"shortcut","name":"same.bin","mimeType":"application/vnd.google-apps.shortcut","parents":["root"]}
+        ])).unwrap();
+        let plan = drive_recovery::plan_recovery_json(&raw).unwrap();
+        let (files, unresolved) = eligible_google_objects(plan);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].object_id.as_deref(), Some("good"));
+        assert_eq!(unresolved, 3, "all ineligible objects must remain visible");
+    }
+
 
 }

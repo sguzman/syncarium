@@ -30,6 +30,11 @@ fn google_url(id: &str) -> Result<Url> {
 /// Do not log its contents or accept permissive file permissions.
 fn read_token(path: &Path) -> Result<String> {
     ensure!(path.is_absolute(), "Google access token file must be an absolute path");
+    for ancestor in path.ancestors() {
+        if ancestor.is_symlink() {
+            bail!("Google token path contains a symlink");
+        }
+    }
     let metadata = fs::symlink_metadata(path).context("Google token file unavailable")?;
     ensure!(metadata.is_file() && !metadata.file_type().is_symlink(),
         "Google access token must be a regular non-symlink file");
@@ -155,4 +160,20 @@ mod tests {
         fs::write(&path, "embedded spaces").unwrap();
         assert!(read_token(&path).is_err());
     }
+    #[cfg(unix)]
+    #[test]
+    fn reject_token_file_through_symlink_parent() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let actual = temp.path().join("private");
+        fs::create_dir(&actual).unwrap();
+        let secret = actual.join("token");
+        fs::write(&secret, b"token-content").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let redirect = temp.path().join("link");
+        symlink(&actual, &redirect).unwrap();
+        assert!(read_token(&redirect.join("token")).is_err());
+        assert_eq!(read_token(&secret).unwrap(), "token-content");
+    }
+
 }
