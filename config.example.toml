@@ -58,3 +58,16 @@ destination = "/drive/icloud/photos/primary"
 # Destination paths are not allowed to nest beneath another source's
 # destination, even when that other source is disabled. This prevents accidental
 # overlap and preserves append-only archive safety.
+
+# EXPERIMENTAL Google Workspace single-shot exports (Docs/Sheets/Slides/Drawings).
+# All authentication is MANUAL. Do NOT enable for unattended hourly syncing.
+# Use an entirely separate, nonnested archive destination.
+# Unversioned or over-budget exports are explicitly held for review.
+#
+# [[sources]]
+# name = "google-workspace"
+# kind = "google_workspace"
+# enabled = false
+# remote = "gdrive:"
+# token_file = "/home/YOUR_USER/.config/syncarium/google-access-token"
+# destination = "/drive/gdrive-workspace"
