@@ -19,7 +19,9 @@ fn google_url(id: &str) -> Result<Url> {
             byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'),
         "unexpected character in Google Drive immutable file ID"
     );
-    let mut url = Url::parse("https://www.googleapis.com/drive/v3/files/")?;
+    // A trailing slash on the base path creates an empty path segment,
+    // yielding /files//<id>. Build from the non-trailing path instead.
+    let mut url = Url::parse("https://www.googleapis.com/drive/v3/files")?;
     url.path_segments_mut().map_err(|_| anyhow::anyhow!("invalid API URL"))?
         .push(id);
     url.query_pairs_mut().append_pair("alt", "media");
