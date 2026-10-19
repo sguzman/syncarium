@@ -1334,4 +1334,31 @@ mod tests {
     }
 
 
+    #[test]
+    fn provider_md5_blocks_bad_publication_and_accepts_verified_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let destination = tmp.path().join("archive");
+        std::fs::create_dir(&destination).unwrap();
+        let part = tmp.path().join("native.part");
+        let meta = tmp.path().join("native.json");
+        std::fs::write(&part, b"correct-data").unwrap();
+        std::fs::write(&meta, b"{}").unwrap();
+        let mut item = Item {
+            path: ".rclone-duplicates/objects/xx/safe.bin".into(),
+            size: 12,
+            version: "immutable-id+version".into(),
+            url: None,
+            sha256: None,
+            object_id: Some("test-google-id".into()),
+            md5: Some("00000000000000000000000000000000".into()),
+        };
+        assert!(publish(&part, &meta, &destination, &item).is_err());
+        assert!(!destination.join(&item.path).exists());
+        assert!(part.exists(), "checksum mismatch must preserve staged bytes");
+        item.md5 = Some(hex::encode(md5::Md5::digest(b"correct-data")));
+        publish(&part, &meta, &destination, &item).unwrap();
+        assert_eq!(std::fs::read(destination.join(&item.path)).unwrap(), b"correct-data");
+        assert!(!part.exists());
+    }
+
 }

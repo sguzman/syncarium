@@ -106,7 +106,9 @@ fn transfer_range(
     let mut response = client.get(url)
         .bearer_auth(token)
         .header(RANGE, format!("bytes={offset}-{end}"))
-        .send().context("Google Drive range request failed")?;
+        // A reqwest error can contain the full request URL, including a
+        // private Google object ID. Never print its Debug/Display form.
+        .send().map_err(|_| anyhow::anyhow!("Google Drive range request failed"))?;
     if response.status().as_u16() != 206 {
         bail!(
             "Google Drive ID range rejected (status {}); token may be expired or server may not support ranges",
@@ -125,7 +127,8 @@ fn transfer_range(
     while saved < length {
         ensure!(started.elapsed() < deadline, "Google Drive transfer exceeded deadline");
         let take = (length - saved).min(buffer.len() as u64) as usize;
-        let count = response.read(&mut buffer[..take])?;
+        let count = response.read(&mut buffer[..take])
+            .map_err(|_| anyhow::anyhow!("Google Drive response read failed"))?;
         ensure!(count > 0, "Google Drive range ended early");
         output.write_all(&buffer[..count])?;
         saved += count as u64;

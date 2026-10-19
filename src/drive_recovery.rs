@@ -1,6 +1,6 @@
 //! Deterministic, identity-addressed Google Drive recovery plans.
-//! Plan only. Actual copyid reads are indivisible and must not bypass the
-//! shared Syncarium byte budget or the large-file resume requirements.
+//! Planning is read-only. The optional native Rust ID adapter consumes this
+//! plan using bounded ranged reads; ordinary rclone copyid is never invoked.
 use anyhow::{bail, ensure, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

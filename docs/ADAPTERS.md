@@ -76,3 +76,5 @@ For the native Google ID adapter, use a distinct destination such as `/drive/gdr
 ### Ineligible Google objects are never silently ignored
 
 The native ID adapter counts every planned collision candidate it cannot download under its conservative contract: unsupported types (including shortcuts), unknown-size exports, and binary files missing a valid MD5. `audit --json` reports `unresolved_provider_items`; `run` continues eligible bytes inside its budget but returns nonzero for incomplete source coverage. No attempt is made to fabricate file sizes or infer an absent hash.
+
+Google object IDs are deliberately omitted from serialized recovery plans and local destination names. The native Rust HTTP adapter also strips underlying HTTP error details that could include immutable Drive IDs or signed request information from logs. File integrity is validated against Google-provided MD5 before publication, but this is not a cryptographic proof against malicious provider responses.
