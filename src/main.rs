@@ -779,15 +779,18 @@ fn download_range(source: &Source, item: &Item, offset: u64, count: u64,
             let url = item.url.as_deref().context("missing URL in HTTP manifest")?;
             let end = offset.checked_add(count).and_then(|n| n.checked_sub(1))
                 .context("invalid byte range")?;
-            let client = Client::builder().timeout(deadline).build()?;
+            let client = Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(deadline)
+                .build()?;
             let mut response = client.get(url)
                 .header(RANGE, format!("bytes={offset}-{end}")).send()?;
             ensure!(response.status().as_u16() == 206,
                 "server did not honor HTTP Range (206 required)");
             let claimed = response.headers().get(CONTENT_RANGE)
                 .context("missing Content-Range")?.to_str()?;
-            ensure!(claimed.starts_with(&format!("bytes {offset}-{end}/")),
-                "server returned incorrect Content-Range");
+            ensure!(claimed == format!("bytes {offset}-{end}/{}", item.size),
+                "server returned incorrect or inconsistent Content-Range");
             let mut file = OpenOptions::new().write(true).truncate(true).open(staging)?;
             let mut received = 0u64;
             let start = Instant::now();

@@ -64,3 +64,5 @@ The optional `drive-collisions --remote gdrive:` command uses the read-only `rcl
 ## ID recovery plans
 
 The `drive-recovery-plan` operation is independent of the ordinary path-based scheduler and is read-only. It maps colliding immutable Google file IDs to stable SHA-256-derived destinations, covering descendants of colliding folders. Run it with `--source google-drive` for the `google-drive` TOML entry; `--fixture <absolute JSON path>` is available for offline validation. No object data is fetched and no payload is published. Actual ID-based recovery needs a backend capable of budgeted, resumable range reads by immutable object ID. Do **not** replace the legacy duplicate-recovery service on the strength of the planner alone.
+
+**HTTP redirects are deliberately disabled.** The final asset URL must directly return HTTP 206 with the exact expected `Content-Range: bytes START-END/TOTAL`. Syncarium verifies the total is the declared manifest size rather than just comparing the downloaded chunk length. If a server responds with a redirect or a different total size, the chunk is rejected and the current partial remains intact.
