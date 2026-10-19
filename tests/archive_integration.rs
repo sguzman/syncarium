@@ -768,3 +768,96 @@ destination = "{}"
     let verified = cli(&["verify", "--source", "photos", "--json"]);
     assert!(verified.status.success(), "{}", String::from_utf8_lossy(&verified.stderr));
 }
+
+
+#[cfg(unix)]
+#[test]
+fn in_run_ignored_offsets_never_poison_icloud_style_checkpoints() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("archive");
+    let dest = root.join("photos");
+    let bin = tmp.path().join("bin");
+    fs::create_dir_all(&dest).unwrap();
+    fs::create_dir(&bin).unwrap();
+
+    // More than two chunks, all requested within a single 4 MiB pass.
+    let bytes: Vec<u8> = (0..2_500_000usize)
+        .map(|i| ((i * 17 + i / 997) % 251) as u8).collect();
+    let remote = tmp.path().join("photo.heic");
+    fs::write(&remote, &bytes).unwrap();
+
+    let stub = bin.join("rclone");
+    fs::write(&stub, r#"#!/bin/sh
+if [ "$1" = "lsjson" ]; then
+    printf '[{"Path":"photo.heic","Size":2500000,"ModTime":"2026-10-01T00:00:00Z","ID":"stable"}]'
+elif [ "$1" = "cat" ]; then
+    shift
+    shift
+    off=0
+    cnt=0
+    while [ "$#" -gt 1 ]; do
+        case "$1" in
+            --offset) off="$2" ;;
+            --count) cnt="$2" ;;
+        esac
+        shift
+        shift
+    done
+    if [ "$SYNCARIUM_BAD_OFFSETS" = "yes" ]; then off=0; fi
+    dd if="$SYNCARIUM_REMOTE" iflag=skip_bytes,count_bytes skip="$off" count="$cnt" status=none
+else
+    exit 17
+fi
+"#).unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 4
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "photos"
+kind = "rclone"
+enabled = true
+remote = "fake:"
+destination = "{}"
+"#, root.display(), dest.display())).unwrap();
+    let run = |bad: bool| Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config).args(["run", "--execute"])
+        .env("PATH", format!("{}:{}", bin.display(),
+            std::env::var("PATH").unwrap_or_default()))
+        .env("SYNCARIUM_REMOTE", &remote)
+        .env("SYNCARIUM_BAD_OFFSETS", if bad { "yes" } else { "no" })
+        .output().unwrap();
+
+    let wrong = run(true);
+    assert!(!wrong.status.success(),
+        "an in-run ignored offset must be rejected before publishing");
+    assert!(String::from_utf8_lossy(&wrong.stderr)
+        .contains("remote chunk overlap differs"));
+    assert!(!dest.join("photo.heic").exists());
+
+    let status = Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config).args(["status", "--json"])
+        .output().unwrap();
+    assert!(status.status.success());
+    let state: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(state["committed_bytes"], 1_048_576,
+        "only the good initial chunk should be committed");
+
+    let correct = run(false);
+    assert!(correct.status.success(), "{}",
+        String::from_utf8_lossy(&correct.stderr));
+    assert_eq!(fs::read(dest.join("photo.heic")).unwrap(), bytes);
+    let checked = Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config)
+        .args(["verify", "--source", "photos", "--json"])
+        .output().unwrap();
+    assert!(checked.status.success());
+}
