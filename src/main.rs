@@ -1323,8 +1323,8 @@ mod tests {
         let raw = serde_json::to_vec(&serde_json::json!([
             {"id":"good","name":"same.bin","mimeType":"application/octet-stream","parents":["root"],"size":"12","md5Checksum":"900150983cd24fb0d6963f7d28e17f72"},
             {"id":"no-hash","name":"same.bin","mimeType":"application/octet-stream","parents":["root"],"size":"12"},
-            {"id":"google-doc","name":"same.bin","mimeType":"application/vnd.google-apps.document","parents":["root"]},
-            {"id":"shortcut","name":"same.bin","mimeType":"application/vnd.google-apps.shortcut","parents":["root"]}
+            {"id":"google-doc","name":"same","mimeType":"application/vnd.google-apps.document","parents":["root"]},
+            {"id":"shortcut","name":"same.docx","mimeType":"application/vnd.google-apps.shortcut","parents":["root"]}
         ])).unwrap();
         let plan = drive_recovery::plan_recovery_json(&raw).unwrap();
         let (files, unresolved) = eligible_google_objects(plan);
