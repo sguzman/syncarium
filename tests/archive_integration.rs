@@ -923,3 +923,113 @@ destination = "{}"
     assert!(!dest.join("family").exists(),
         "diagnostic must not create archive media paths");
 }
+
+
+#[test]
+fn photos_compare_cli_detects_missing_legacy_archive_entries_without_network() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("nonexistent-archive");
+    let destination = root.join("photos");
+    // Neither root nor destination exists: comparison must remain offline
+    // and independent of the mounted archive and cloud accounts.
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "icloud-photos"
+kind = "rclone"
+enabled = false
+remote = "not-configured:"
+destination = "{}"
+"#, root.display(), destination.display())).unwrap();
+
+    let reference = tmp.path().join("private-archive.json");
+    let candidate = tmp.path().join("private-cloud.json");
+    fs::write(&reference, serde_json::to_vec(&serde_json::json!([
+        {"Path":"family/private-original.heic","Size":100,"ID":"local-999","ModTime":"1970"},
+        {"Path":"family/extra.mov","Size":500,"ID":"local-888","ModTime":"1970"}
+    ])).unwrap()).unwrap();
+    fs::write(&candidate, serde_json::to_vec(&serde_json::json!([
+        {"Path":"family/private-original.heic","Size":100,"ID":"private-provider-id","ModTime":"2026"},
+        {"Path":"family/unarchived-video.mov","Size":700,"ID":"private-provider-other","ModTime":"2026"}
+    ])).unwrap()).unwrap();
+
+    let command = || Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config)
+        .args(["photos-compare", "--source", "icloud-photos", "--reference"])
+        .arg(&reference).arg("--candidate").arg(&candidate)
+        .args(["--reference-kind", "archive", "--json"])
+        .output().unwrap();
+
+    let compared = command();
+    assert!(!compared.status.success(), "an absent local counterpart cannot be silently accepted");
+    let report: serde_json::Value = serde_json::from_slice(&compared.stdout).unwrap();
+    assert_eq!(report["reference_kind"], "archive");
+    assert_eq!(report["reference_only"], 1);
+    assert_eq!(report["candidate_only"], 1);
+    assert_eq!(report["same_size"], 1);
+    assert_eq!(report["candidate_bytes_not_size_matched"], 700);
+    assert_eq!(report["differing_provider_ids"], 0,
+        "local inode IDs cannot be compared to cloud object IDs");
+    assert_eq!(report["differing_modified_times"], 0,
+        "local filesystem mtimes cannot be compared to cloud mtimes");
+    for secret in ["private-original", "unarchived-video", "private-provider-id", "family/"] {
+        assert!(!String::from_utf8_lossy(&compared.stdout).contains(secret),
+            "raw cloud or local archive path leaked to comparison output");
+    }
+    assert_eq!(compared.stdout, command().stdout, "comparison should be deterministic");
+    assert!(!root.exists(), "offline analysis must not touch the archive");
+}
+
+#[test]
+fn photos_compare_cli_matching_paths_do_not_claim_file_hash_integrity() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("not-created");
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "photos"
+kind = "rclone"
+enabled = false
+remote = "unconfigured:"
+destination = "{}"
+"#, root.display(), root.join("photos").display())).unwrap();
+    let first = tmp.path().join("first.json");
+    let second = tmp.path().join("second.json");
+    let sample = br#"[{"Path":"photo.heic","Size":4096,"ID":"private-id","ModTime":"2026"}]"#;
+    fs::write(&first, sample).unwrap();
+    fs::write(&second, sample).unwrap();
+    let run = || Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config)
+        .args(["photos-compare", "--source", "photos", "--reference"])
+        .arg(&first).arg("--candidate").arg(&second).arg("--json")
+        .output().unwrap();
+    let ok = run();
+    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&ok.stdout).unwrap();
+    assert_eq!(report["same_size"], 1);
+    assert_eq!(report["reference_only"], 0);
+    assert!(report["caveat"].as_str().unwrap().contains("not file content"));
+    fs::write(&second, b"[]").unwrap();
+    let empty = run();
+    assert!(!empty.status.success(), "empty result is not proof of complete provider coverage");
+    let report: serde_json::Value = serde_json::from_slice(&empty.stdout).unwrap();
+    assert_eq!(report["candidate_files"], 0);
+    assert_eq!(report["reference_only"], 1);
+    assert!(!root.exists());
+}
