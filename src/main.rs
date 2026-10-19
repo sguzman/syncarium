@@ -999,15 +999,40 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
     items.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Listing { files: items, exports, unresolved })
 }
+// A malformed/cloud-side runaway listing must not fill the system's temp
+// filesystem. In particular, iCloud Photos can enumerate very large albums.
+// This ceiling bounds BOTH temporary disk consumption and JSON allocation.
+const MAX_PROVIDER_LISTING_BYTES: u64 = 256 * 1024 * 1024;
+
 fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
+    command_output_with_limit(command, timeout, MAX_PROVIDER_LISTING_BYTES)
+}
+
+fn command_output_with_limit(
+    command: &mut Command,
+    timeout: Duration,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    ensure!(max_bytes > 0, "provider listing byte limit must be positive");
+    ensure!(timeout > Duration::ZERO, "provider command requires nonzero deadline");
     let stdout = NamedTempFile::new()?;
     command.stdout(Stdio::from(stdout.reopen()?)).stderr(Stdio::null());
     let mut child = command.spawn().context("starting external provider backend")?;
     let start = Instant::now();
     loop {
+        // Inspect the actual output file on every poll, including AFTER the
+        // subprocess terminates. Never load oversized JSON into Rust memory.
+        if stdout.as_file().metadata()?.len() > max_bytes {
+            child.kill().ok();
+            child.wait().ok();
+            bail!("provider inventory exceeded {max_bytes} byte output limit; refusing incomplete listing");
+        }
         if let Some(status) = child.try_wait()? {
             ensure!(status.success(), "provider command failed (status {status})");
-            return Ok(fs::read(stdout.path())?);
+            // A final check covers races between metadata sampling and exit.
+            ensure!(stdout.as_file().metadata()?.len() <= max_bytes,
+                "provider inventory exceeded {max_bytes} byte output limit");
+            return fs::read(stdout.path()).context("reading bounded provider listing");
         }
         if start.elapsed() >= timeout {
             child.kill().ok();
@@ -2068,6 +2093,35 @@ mod tests {
         assert!(enforce_listing_floor(&source, 2, 9_999).is_err());
         assert!(enforce_listing_floor(&source, 2, 10_000).is_ok());
         assert!(enforce_listing_floor(&source, 1, 100_000).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_stdout_is_bounded_before_json_can_be_loaded() {
+        let mut overflowing = Command::new("sh");
+        overflowing.args(["-c", "head -c 8192 /dev/zero"]);
+        let err = command_output_with_limit(
+            &mut overflowing, Duration::from_secs(5), 1024
+        ).unwrap_err();
+        assert!(format!("{err:#}").contains("output limit"));
+
+        let mut small = Command::new("sh");
+        small.args(["-c", "printf 'valid-small-listing'"]);
+        let output = command_output_with_limit(
+            &mut small, Duration::from_secs(5), 1024
+        ).unwrap();
+        assert_eq!(output, b"valid-small-listing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_provider_command_is_terminated() {
+        let mut delayed = Command::new("sh");
+        delayed.args(["-c", "sleep 2"]);
+        let err = command_output_with_limit(
+            &mut delayed, Duration::from_millis(50), 1024
+        ).unwrap_err();
+        assert!(format!("{err:#}").contains("timeout"));
     }
 
 }
