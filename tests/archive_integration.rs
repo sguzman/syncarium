@@ -752,7 +752,7 @@ destination = "{}"
     fs::write(&remote_file, vec![42u8; length]).unwrap();
     let drift = cli(&["run", "--execute"]);
     assert!(!drift.status.success(), "a changed remote last chunk must be held");
-    assert!(String::from_utf8_lossy(&drift.stderr).contains("remote resume overlap differs"));
+    assert!(String::from_utf8_lossy(&drift.stderr).contains("remote chunk overlap differs"));
     assert!(!destination.join("photo.bin").exists());
     let after = cli(&["status", "--json"]);
     assert!(after.status.success());
