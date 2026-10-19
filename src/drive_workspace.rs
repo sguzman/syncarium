@@ -3,7 +3,7 @@
 //! Workspace exports are generally NOT resumable byte-range blobs. The
 //! planner is read-only. The HTTP reader is intentionally not registered as
 //! an unattended scheduler adapter until source-version pinning is validated.
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::Url;
@@ -35,9 +35,9 @@ pub(crate) struct ExportCandidate {
     /// Never serialized or written into public repo/logs.
     #[serde(skip_serializing)]
     pub(crate) object_id: String,
-    /// Source version is retained for future immutable consistency checks.
-    #[serde(skip_serializing)]
-    pub(crate) source_version: Option<String>,
+    /// Some Google Workspace inventory objects omit modification metadata.
+    /// This does NOT pin an immutable export revision.
+    pub(crate) source_version_known: bool,
     pub(crate) object_fingerprint: String,
     pub(crate) relative_destination: String,
     pub(crate) source_mime: String,
@@ -85,7 +85,7 @@ pub(crate) fn plan(raw: &[u8]) -> Result<ExportPlan> {
             let hash = hex::encode(Sha256::digest(obj.id.as_bytes()));
             supported.push(ExportCandidate {
                 object_id: obj.id,
-                source_version: obj.modified_time,
+                source_version_known: obj.modified_time.is_some(),
                 object_fingerprint: hash.clone(),
                 relative_destination: format!(
                     "workspace-exports/{}/id-{hash}{extension}", &hash[..2]
@@ -114,8 +114,6 @@ fn export_url(id: &str, export_mime: &str) -> Result<Url> {
     ensure!(!id.is_empty() && id.len() <= 512
         && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'),
         "invalid immutable Google file ID");
-    ensure!(format_for_type("application/vnd.google-apps.document").is_some(),
-        "missing Workspace export registry");
     let mut url = Url::parse("https://www.googleapis.com/drive/v3/files")?;
     url.path_segments_mut()
         .map_err(|_| anyhow::anyhow!("Google API path invalid"))?
@@ -230,7 +228,7 @@ mod tests {
         assert!(!printed.contains("private-personal"));
         assert!(!printed.contains("secret-doc-123"));
         assert!(!printed.contains("2026-10-01"));
-        let plan2 = plan(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        let plan2 = super::plan(&serde_json::to_vec(&raw).unwrap()).unwrap();
         assert_eq!(serde_json::to_string(&plan).unwrap(), serde_json::to_string(&plan2).unwrap());
         assert!(plan.supported.iter().all(|item|
             item.relative_destination.starts_with("workspace-exports/")));
