@@ -375,3 +375,84 @@ destination = "{}"
         "read-only plan must not create archive directories");
     assert_eq!(first.stdout, command().stdout, "planning must be deterministic");
 }
+
+
+#[cfg(unix)]
+#[test]
+fn workspace_source_offline_listing_reports_incomplete_coverage_without_transfers() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("archive");
+    let destination = root.join("workspace");
+    fs::create_dir_all(&destination).unwrap();
+
+    let fixture = tmp.path().join("google-objects.json");
+    fs::write(&fixture, serde_json::to_vec(&serde_json::json!([
+        {"id":"valid-doc","name":"Budget",
+         "mimeType":"application/vnd.google-apps.spreadsheet",
+         "modifiedTime":"2026-10-19T12:00:00Z"},
+        {"id":"no-version","name":"Notes",
+         "mimeType":"application/vnd.google-apps.document"},
+        {"id":"unexportable-form","name":"Survey",
+         "mimeType":"application/vnd.google-apps.form"}
+    ])).unwrap()).unwrap();
+
+    // The binary invokes "rclone backend query" as its metadata adapter.
+    // Keep the integration entirely offline by providing a fixture-backed
+    // subprocess in a temp PATH, without accessing any actual user remote.
+    let fake_bin = tmp.path().join("bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let rclone = fake_bin.join("rclone");
+    fs::write(&rclone,
+        "#!/bin/sh\n[ \"$1\" = \"backend\" ] && [ \"$2\" = \"query\" ] || exit 9\ncat \"$SYNCARIUM_FAKE_DRIVE_JSON\"\n"
+    ).unwrap();
+    fs::set_permissions(&rclone, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "workspace"
+kind = "google_workspace"
+enabled = true
+remote = "fake:"
+token_file = "{}"
+destination = "{}"
+"#, root.display(),
+        tmp.path().join("token-should-not-exist").display(),
+        destination.display()
+    )).unwrap();
+
+    let run = |action: &[&str]| Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config).args(action)
+        .env("PATH", format!("{}:{}", fake_bin.display(),
+            std::env::var("PATH").unwrap_or_default()))
+        .env("SYNCARIUM_FAKE_DRIVE_JSON", &fixture)
+        .output().unwrap();
+
+    let preview = run(&["run"]);
+    assert!(!preview.status.success(),
+        "unsupported or unversioned Google objects must fail the coverage check");
+    let shown = String::from_utf8_lossy(&preview.stdout);
+    assert!(shown.contains("1 pending Workspace export(s)"), "{shown}");
+    assert!(!destination.join("workspace-exports").exists());
+    assert!(!root.join(".syncarium/receipts").exists());
+
+    let audit = run(&["audit", "--json"]);
+    assert!(!audit.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    let row = &report["sources"][0];
+    assert_eq!(row["workspace_export_candidates"], 1);
+    assert_eq!(row["unresolved_provider_items"], 2);
+    assert_eq!(row["missing_files"], 1);
+    assert_eq!(row["historical_absent"], 0);
+    assert!(!destination.join("workspace-exports").exists());
+    assert!(!root.join(".syncarium/receipts").exists());
+}
