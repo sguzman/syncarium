@@ -244,6 +244,7 @@ fn drive_recovery_plan(
         .with_context(|| format!("Google Drive source '{source_name}' not configured"))?;
     let remote = match &source.backend {
         Backend::Rclone { remote } => remote.as_str(),
+        Backend::GoogleDriveIds { remote, .. } => remote.as_str(),
         Backend::HttpManifest { .. } => bail!("Drive recovery requires an rclone source"),
     };
     ensure!(
@@ -1210,7 +1211,7 @@ mod tests {
     fn new_checkpoints_do_not_limit_file_size() {
         let tmp = tempfile::tempdir().unwrap();
         let item = Item { path: "large.mp4".into(), size: 10_000_000_000,
-            version: "v1".into(), url: None, sha256: None, object_id: None, md5: None, object_id: None, md5: None };
+            version: "v1".into(), url: None, sha256: None, object_id: None, md5: None };
         let (cp, part, _) = checkpoint(tmp.path(), "photos", &item, false).unwrap();
         assert_eq!(cp.committed, 0);
         assert!(!part.exists());
@@ -1218,7 +1219,7 @@ mod tests {
     #[test]
     fn atomic_state_detects_source_changes() {
         let tmp = tempfile::tempdir().unwrap();
-        let item = Item { path: "x".into(), size: 100, version: "v1".into(), url: None, sha256: None };
+        let item = Item { path: "x".into(), size: 100, version: "v1".into(), url: None, sha256: None, object_id: None, md5: None };
         checkpoint(tmp.path(), "photos", &item, true).unwrap();
         let other = Item { version: "v2".into(), ..item };
         assert!(checkpoint(tmp.path(), "photos", &other, false).is_err());
