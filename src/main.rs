@@ -1552,7 +1552,11 @@ fn advance_source(
         remaining.saturating_sub(Duration::from_secs(2)),
         chunk.path(),
     )?;
-    store_chunk_with_overlap(&part, &meta, &mut cp, chunk.path(), overlap)?;
+    if overlap == 0 {
+        store_chunk(&part, &meta, &mut cp, chunk.path())?;
+    } else {
+        store_chunk_with_overlap(&part, &meta, &mut cp, chunk.path(), overlap)?;
+    }
     if overlap > 0 {
         println!("RESUME CHECK {} {} verified {} in-request remote bytes",
             pending.source.name, item.path, overlap);
