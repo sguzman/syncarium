@@ -65,23 +65,32 @@ fn validate_range(content_range: &str, offset: u64, length: u64, total: u64)
     Ok(())
 }
 
+/// Exact byte coordinates for a single immutable Google blob read.
+#[derive(Clone, Copy)]
+pub(crate) struct RangeSpec {
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+    pub(crate) total: u64,
+}
+
+/// Source-independent limits passed through the global transfer scheduler.
+#[derive(Clone, Copy)]
+pub(crate) struct TransferLimits {
+    pub(crate) rate_kib: u64,
+    pub(crate) deadline: Duration,
+}
+
 /// Request an exact byte range from Google's file-ID endpoint.
 /// Blob files only. Google-native Docs require a separate export adapter.
 pub(crate) fn read_range(
     token_file: &Path,
     object_id: &str,
-    offset: u64,
-    length: u64,
-    total: u64,
-    rate_kib: u64,
-    deadline: Duration,
+    range: RangeSpec,
+    limits: TransferLimits,
     staging: &Path,
 ) -> Result<()> {
-    ensure!(length > 0 && rate_kib > 0 && deadline > Duration::ZERO,
-        "invalid transfer budget");
     let token = read_token(token_file)?;
-    transfer_range(&token, google_url(object_id)?, offset, length, total,
-        rate_kib, deadline, staging)
+    transfer_range(&token, google_url(object_id)?, range, limits, staging)
 }
 
 /// Internal transport primitive, shared by the production Google URL and
@@ -89,13 +98,12 @@ pub(crate) fn read_range(
 fn transfer_range(
     token: &str,
     url: Url,
-    offset: u64,
-    length: u64,
-    total: u64,
-    rate_kib: u64,
-    deadline: Duration,
+    range: RangeSpec,
+    limits: TransferLimits,
     staging: &Path,
 ) -> Result<()> {
+    let RangeSpec { offset, length, total } = range;
+    let TransferLimits { rate_kib, deadline } = limits;
     ensure!(length > 0 && rate_kib > 0 && deadline > Duration::ZERO,
         "invalid transfer budget");
     let end = offset.checked_add(length).and_then(|v| v.checked_sub(1))
@@ -240,7 +248,9 @@ mod tests {
             let success = transfer_range(
                 "fake-test-token",
                 Url::parse(&format!("http://{address}/file")).unwrap(),
-                2, 3, 10, 10240, Duration::from_secs(5), &staging
+                RangeSpec { offset: 2, length: 3, total: 10 },
+                TransferLimits { rate_kib: 10240, deadline: Duration::from_secs(5) },
+                &staging
             );
             let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
             server.join().unwrap();

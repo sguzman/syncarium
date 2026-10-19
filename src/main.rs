@@ -828,7 +828,9 @@ fn download_range(source: &Source, item: &Item, offset: u64, count: u64,
         Backend::GoogleDriveIds { token_file, .. } => {
             drive_id::read_range(
                 token_file, item.object_id.as_deref().context("missing Google immutable ID")?,
-                offset, count, item.size, rate_kib, deadline, staging
+                drive_id::RangeSpec { offset, length: count, total: item.size },
+                drive_id::TransferLimits { rate_kib, deadline },
+                staging
             )?;
         }
         Backend::Rclone { remote } => {
