@@ -174,3 +174,60 @@ destination = "{}"
         "the failed provider should be identified"
     );
 }
+
+
+#[test]
+fn drive_recovery_cli_plans_immutable_ids_without_local_writes() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("archive");
+    let dest = root.join("gdrive");
+    fs::create_dir_all(&dest).unwrap();
+
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "google-drive"
+kind = "rclone"
+enabled = false
+remote = "gdrive:"
+destination = "{}"
+"#, root.display(), dest.display()
+    )).unwrap();
+
+    let fixture = tmp.path().join("drive-objects.json");
+    fs::write(&fixture, serde_json::to_vec(&serde_json::json!([
+        {"id":"object-A","name":"private-photo.jpg","mimeType":"image/jpeg","parents":["root"],"size":"123"},
+        {"id":"object-B","name":"private-photo.jpg","mimeType":"image/jpeg","parents":["root"],"size":123},
+        {"id":"unrelated","name":"different.txt","mimeType":"text/plain","parents":["root"],"size":30}
+    ])).unwrap()).unwrap();
+
+    let cli = env!("CARGO_BIN_EXE_syncarium");
+    let invoke = || Command::new(cli)
+        .arg("--config").arg(&config)
+        .args(["drive-recovery-plan", "--source", "google-drive", "--fixture"])
+        .arg(&fixture).arg("--json").output().unwrap();
+
+    let first = invoke();
+    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(json["items"].as_array().unwrap().len(), 2);
+    assert_eq!(json["known_size_bytes"], 246);
+    let path_a = json["items"][0]["relative_destination"].as_str().unwrap();
+    let path_b = json["items"][1]["relative_destination"].as_str().unwrap();
+    assert_ne!(path_a, path_b);
+    assert!(path_a.starts_with(".rclone-duplicates/objects/"));
+    let output = String::from_utf8_lossy(&first.stdout);
+    assert!(!output.contains("object-A"));
+    assert!(!output.contains("private-photo"));
+    assert!(!dest.join(".rclone-duplicates").exists(),
+        "read-only planning must not create output folders");
+    assert_eq!(invoke().stdout, first.stdout, "plans must be deterministic");
+}
