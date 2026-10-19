@@ -31,3 +31,7 @@ The standard iCloud Photos backend is considered experimental upstream. Cache fr
 ## Metadata subprocess hardening
 
 Provider commands have explicit deadlines and a maximum 256 MiB inventory output ceiling. Listing parser failures, output overflows, and missing critical fields are treated as **source failures** rather than an empty or successful archive inventory. This ceiling is a safety guard, not a substitute for the separate runtime budget or a proof that listings are complete.
+
+## Ranged-read diagnostic gate
+
+An explicit `probe-range --source SOURCE --execute` operation can test the established rclone bridge independently of archive publication. It performs three 64 KiB overlapping reads from a provider-listed file, and compares their overlaps to detect broken offsets. It writes only disposable temporary files. The command never runs as part of routine syncing. A passed probe is a necessary diagnostic signal, **not** proof of cloud library completeness or original-quality media recovery. The Rust reader also limits stdout bytes to a reserved chunk, independent of whether rclone obeys its `--count` option. Both features are covered by offline fake-rclone tests. Live iCloud behavior remains unverified.

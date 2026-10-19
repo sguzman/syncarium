@@ -134,3 +134,13 @@ Intentional remote deletion, rename, or access-permission changes can also trigg
 ## Oversized provider listings
 
 When a provider's `rclone lsjson` or ID metadata query produces more than Syncarium's 256 MiB inventory output ceiling, the listing fails with a nonzero result. No remote listing entries from that command are accepted and no transfers from that source begin. This is a safety measure against runaway or malformed output, not a reason to delete your rclone cache or raise the limit without checking the source. Very large iCloud photo libraries may require a future scoped or streaming inventory mechanism; this has not been live validated.
+
+## Optional iCloud Photos range probe (controlled live QA only)
+
+The rclone iCloud Photos backend remains experimental. You can preview a future diagnostic without contacting any cloud account:
+
+`syncarium --config ~/.config/syncarium/config.toml probe-range --source icloud-photos`
+
+**Do not execute a live test until explicitly approved.** Once authorization and local provider configuration have been reviewed, appending `--execute` will enumerate that **single configured rclone source** and request three overlapping 64 KiB windows (192 KiB of accepted provider stdout total) from one existing source file, without creating or editing any archive files. It uses the existing rclone authorization, not a new OAuth flow. An ignored or incorrect offset, short response, excessive response, timeout, or ambiguous uniform-content sample produces a nonzero result.
+
+Note that an rclone provider, especially iCloud, may retrieve more underlying network traffic than the sampled stdout count because of internal caches, whole-file fetches or metadata enumeration. The 192 KiB figure bounds **accepted payload output**, not provider-internal network usage. The source listing may be expensive for a large iCloud Photos library. The probe does not demonstrate original photo quality, Live Photo companions or full library coverage. Do not add it to the hourly timer.
