@@ -241,8 +241,6 @@ struct Pending {
     index: usize,
     exports: Vec<drive_workspace::ExportCandidate>,
     export_index: usize,
-    /// Index of the staged item whose remote tail was checked in this pass.
-    resume_checked_index: Option<usize>,
     consecutive_failures: u8,
     circuit_open: bool,
 }
@@ -852,6 +850,11 @@ fn checkpoint(root: &Path, source: &str, item: &Item, create: bool)
         && cp.expected_sha256 == item.sha256 && cp.expected_md5 == item.md5,
         "source changed during staged download: {}; preserved for review", item.path);
     ensure!(cp.committed <= item.size, "invalid stored byte offset");
+    ensure!(cp.committed == 0 || (cp.last_size > 0
+        && cp.last_offset.checked_add(cp.last_size) == Some(cp.committed)
+        && cp.last_sha256.len() == 64
+        && cp.last_sha256.bytes().all(|ch| ch.is_ascii_hexdigit())),
+        "committed checkpoint has no valid last-chunk provenance");
     let actual = fs::metadata(&part)?.len();
     ensure!(actual >= cp.committed, "partial shrunk unexpectedly");
     if create && actual > cp.committed {
@@ -1178,16 +1181,43 @@ fn download_range(source: &Source, item: &Item, offset: u64, count: u64,
     Ok(())
 }
 fn store_chunk(part: &Path, meta: &Path, cp: &mut Checkpoint, chunk: &Path) -> Result<()> {
+    store_chunk_with_overlap(part, meta, cp, chunk, 0)
+}
+
+/// Every noninitial range request includes a few already committed bytes.
+/// Validate them against the *actual request's* payload before appending
+/// anything. An ignored offset must never poison an archive checkpoint.
+fn store_chunk_with_overlap(
+    part: &Path,
+    meta: &Path,
+    cp: &mut Checkpoint,
+    chunk: &Path,
+    overlap: u64,
+) -> Result<()> {
     let content = fs::read(chunk)?;
+    ensure!(overlap <= cp.committed && overlap <= content.len() as u64,
+        "invalid overlapping range length");
     ensure!(fs::metadata(part)?.len() == cp.committed, "partial size mismatch");
+    if overlap > 0 {
+        let mut committed = File::open(part)?;
+        committed.seek(SeekFrom::Start(cp.committed - overlap))?;
+        let mut expected = vec![0u8; overlap as usize];
+        committed.read_exact(&mut expected)?;
+        ensure!(expected == content[..overlap as usize],
+            "remote chunk overlap differs from saved bytes; preserving partial for review");
+    }
+    let new_bytes = &content[overlap as usize..];
+    ensure!(!new_bytes.is_empty(), "overlap-only request cannot advance checkpoint");
+    let offset = cp.committed;
+    let new_total = offset.checked_add(new_bytes.len() as u64)
+        .context("staged byte offset overflow")?;
     let mut writer = OpenOptions::new().append(true).open(part)?;
-    writer.write_all(&content)?;
+    writer.write_all(new_bytes)?;
     writer.sync_all()?;
-    let start = cp.committed;
-    cp.committed += content.len() as u64;
-    cp.last_offset = start;
-    cp.last_size = content.len() as u64;
-    cp.last_sha256 = hex::encode(Sha256::digest(&content));
+    cp.committed = new_total;
+    cp.last_offset = offset;
+    cp.last_size = new_bytes.len() as u64;
+    cp.last_sha256 = hex::encode(Sha256::digest(new_bytes));
     atomic_json(meta, cp)
 }
 /// A matching path is not automatically a valid archived copy. Fail closed
@@ -1458,28 +1488,25 @@ fn advance_source(
     }
     let (mut cp, part, meta) =
         checkpoint(&cfg.archive_root, &pending.source.name, item, true)?;
-    if cp.committed > 0 && pending.resume_checked_index != Some(pending.index) {
-        let size = cp.last_size.min(RESUME_OVERLAP_BYTES);
-        ensure!(size > 0, "staged bytes exist without a complete last-chunk checkpoint");
-        let time_bytes = cfg.scheduler.bandwidth_kib.saturating_mul(1024)
-            .saturating_mul(remaining.as_secs().saturating_sub(4));
-        // A verification request consumes the SAME budget as ordinary data.
-        // If the configured pass cannot afford it, postpone the item instead
-        // of silently accepting the incomplete consistency check.
-        if *budget < size || time_bytes < size {
-            return Ok(false);
-        }
-        *budget -= size;
-        check_remote_resume_tail(
-            &pending.source, item, &cp, &part, cfg.scheduler.bandwidth_kib,
-            remaining.saturating_sub(Duration::from_secs(2)),
-        )?;
-        pending.resume_checked_index = Some(pending.index);
-        println!("RESUME CHECK {} {} verified {} remote bytes",
-            pending.source.name, item.path, size);
-        return Ok(true);
-    }
     if cp.committed == item.size {
+        // A crash can happen after the final checkpoint but before durable
+        // publication. Verify the saved tail against the current provider
+        // before linking a potentially stale finished partial into archive.
+        if cp.committed > 0 {
+            let verify_bytes = cp.last_size.min(RESUME_OVERLAP_BYTES);
+            let time_bytes = cfg.scheduler.bandwidth_kib.saturating_mul(1024)
+                .saturating_mul(remaining.as_secs().saturating_sub(4));
+            if *budget < verify_bytes || time_bytes < verify_bytes {
+                return Ok(false);
+            }
+            *budget -= verify_bytes;
+            check_remote_resume_tail(
+                &pending.source, item, &cp, &part, cfg.scheduler.bandwidth_kib,
+                remaining.saturating_sub(Duration::from_secs(2)),
+            )?;
+            println!("RESUME CHECK {} {} verified {} remote bytes",
+                pending.source.name, item.path, verify_bytes);
+        }
         publish(
             &cfg.archive_root, &pending.source.name,
             &part, Some(&meta), &pending.source.destination, item,
@@ -1488,32 +1515,48 @@ fn advance_source(
         return Ok(true);
     }
     let seconds = remaining.as_secs().saturating_sub(4);
-    let time_budget = cfg.scheduler.bandwidth_kib * 1024 * seconds;
-    let n = (*budget)
-        .min(chunk_limit)
+    let time_budget = cfg.scheduler.bandwidth_kib.saturating_mul(1024)
+        .saturating_mul(seconds);
+    let overlap = if cp.committed > 0 {
+        cp.last_size.min(RESUME_OVERLAP_BYTES)
+    } else {
+        0
+    };
+    // Even when the provider ignores --offset, the overlapping bytes in
+    // THIS range response must match our last committed bytes.
+    let max_request = 64 * 1024 * 1024u64;
+    let n = budget.saturating_sub(overlap)
+        .min(chunk_limit.saturating_sub(overlap))
         .min(item.size - cp.committed)
-        .min(time_budget);
+        .min(time_budget.saturating_sub(overlap))
+        .min(max_request.saturating_sub(overlap));
     if n == 0 {
         return Ok(false);
     }
-    // Account for attempted bytes before starting any network operation.
-    *budget -= n;
+    let requested = n + overlap;
+    let request_offset = cp.committed - overlap;
+    // Reserve overlap and fresh bytes together, before contacting provider.
+    *budget -= requested;
     let folder = part.parent().context("missing staged directory")?;
     let chunk = NamedTempFile::new_in(folder)?;
     println!(
-        "CHUNK {} {} @{} +{}",
-        pending.source.name, item.path, cp.committed, n
+        "CHUNK {} {} @{} +{} (including {} verification bytes)",
+        pending.source.name, item.path, request_offset, requested, overlap
     );
     download_range(
         &pending.source,
         item,
-        cp.committed,
-        n,
+        request_offset,
+        requested,
         cfg.scheduler.bandwidth_kib,
         remaining.saturating_sub(Duration::from_secs(2)),
         chunk.path(),
     )?;
-    store_chunk(&part, &meta, &mut cp, chunk.path())?;
+    store_chunk_with_overlap(&part, &meta, &mut cp, chunk.path(), overlap)?;
+    if overlap > 0 {
+        println!("RESUME CHECK {} {} verified {} in-request remote bytes",
+            pending.source.name, item.path, overlap);
+    }
     if cp.committed == item.size {
         publish(
             &cfg.archive_root, &pending.source.name,
@@ -1710,7 +1753,6 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
             index: 0,
             exports: export_queue,
             export_index: 0,
-            resume_checked_index: None,
             consecutive_failures: 0,
             circuit_open: false,
         });
@@ -1879,7 +1921,6 @@ mod tests {
             index: 0,
             exports: Vec::new(),
             export_index: 0,
-            resume_checked_index: None,
             consecutive_failures: 0,
             circuit_open: false,
         };
@@ -2116,7 +2157,6 @@ mod tests {
         let mut pending = Pending {
             source, files: Vec::new(), index: 0,
             exports: vec![candidate], export_index: 0,
-            resume_checked_index: None,
             consecutive_failures: 0, circuit_open: false,
         };
         let mut budget = 12 * 1024 * 1024;
@@ -2176,7 +2216,6 @@ mod tests {
         let mut pending = Pending {
             source: cfg.sources[0].clone(), files: Vec::new(), index: 0,
             exports: vec![candidate], export_index: 0,
-            resume_checked_index: None,
             consecutive_failures: 0, circuit_open: false,
         };
         let mut budget = 12 * 1024 * 1024;
@@ -2276,6 +2315,61 @@ mod tests {
         let err = bounded_rclone_chunk(
             &mut stalled, 32, Duration::from_millis(70), &stage).unwrap_err();
         assert!(format!("{err:#}").contains("timed out"));
+    }
+
+    #[test]
+    fn same_length_chunk_with_wrong_offset_never_changes_saved_partial() {
+        let temp = tempfile::tempdir().unwrap();
+        let item = Item {
+            path: "clip.mov".into(), size: 12,
+            version: "v1".into(), url: None, sha256: None,
+            object_id: None, md5: None,
+        };
+        let (mut cp, part, meta) =
+            checkpoint(temp.path(), "photos", &item, true).unwrap();
+        let first = temp.path().join("first");
+        std::fs::write(&first, b"abcd").unwrap();
+        store_chunk(&part, &meta, &mut cp, &first).unwrap();
+
+        let second = temp.path().join("second");
+        std::fs::write(&second, b"abcdxyzw").unwrap();
+        store_chunk_with_overlap(&part, &meta, &mut cp, &second, 4).unwrap();
+        assert_eq!(cp.committed, 8);
+        assert_eq!(std::fs::read(&part).unwrap(), b"abcdxyzw");
+        let manifest = std::fs::read(&meta).unwrap();
+
+        let wrong = temp.path().join("wrong");
+        std::fs::write(&wrong, b"abcd1234").unwrap();
+        let err = store_chunk_with_overlap(&part, &meta, &mut cp, &wrong, 4)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("overlap differs"));
+        assert_eq!(std::fs::read(&part).unwrap(), b"abcdxyzw");
+        assert_eq!(std::fs::read(&meta).unwrap(), manifest);
+        assert_eq!(cp.committed, 8);
+
+        let correct = temp.path().join("correct");
+        std::fs::write(&correct, b"xyzw1234").unwrap();
+        store_chunk_with_overlap(&part, &meta, &mut cp, &correct, 4).unwrap();
+        assert_eq!(cp.committed, 12);
+        assert_eq!(std::fs::read(&part).unwrap(), b"abcdxyzw1234");
+    }
+
+    #[test]
+    fn corrupt_checkpoint_with_committed_bytes_but_no_tail_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let item = Item {
+            path: "corrupt.mov".into(), size: 100,
+            version: "v1".into(), url: None, sha256: None,
+            object_id: None, md5: None,
+        };
+        let (mut cp, part, meta) =
+            checkpoint(temp.path(), "photos", &item, true).unwrap();
+        std::fs::write(&part, b"abcd").unwrap();
+        cp.committed = 4;
+        cp.last_size = 0;
+        atomic_json(&meta, &cp).unwrap();
+        assert!(checkpoint(temp.path(), "photos", &item, true).is_err());
+        assert_eq!(std::fs::read(&part).unwrap(), b"abcd");
     }
 
 }
