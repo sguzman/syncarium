@@ -447,11 +447,14 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
                     row.unresolved_provider_items = listing.unresolved as u64;
                     errors += 1;
                 }
+                row.workspace_export_candidates = listing.exports.len() as u64;
                 let items = listing.files;
+                let exports = listing.exports;
                 match inventory::observe(
                     &cfg.archive_root,
                     &source.name,
-                    items.iter().map(|item| item.path.as_str()),
+                    items.iter().map(|item| item.path.as_str())
+                        .chain(exports.iter().map(|item| item.relative_destination.as_str())),
                     false,
                 ) {
                     Ok(observation) => {
@@ -467,6 +470,21 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
                         errors += 1;
                         report.sources.push(row);
                         continue;
+                    }
+                }
+                for candidate in &exports {
+                    let target = source.destination.join(safe_relative(&candidate.relative_destination)?);
+                    no_symlink_ancestors(&target)?;
+                    if target.exists() {
+                        if receipts::check_export_target(
+                            &cfg.archive_root, &source.name,
+                            &candidate.relative_destination, candidate.version_key(),
+                            &target
+                        ).is_err() {
+                            row.held_files += 1;
+                        }
+                    } else {
+                        row.missing_files += 1;
                     }
                 }
                 for item in items {
@@ -521,9 +539,9 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
                 println!("{}: listing FAILED: {}", row.name, error);
             } else {
                 println!(
-                    "{}: {} eligible listed, {} size-matched local, {} staged, {} missing, {} mismatched, {} held, {} unresolved, {} historically observed but absent",
-                    row.name, row.listed_files, row.present_size_matched,
-                    row.staged_files, row.missing_files,
+                    "{}: {} eligible listed, {} Workspace exports, {} size-matched local, {} staged, {} missing, {} mismatched, {} held, {} unresolved, {} historically observed but absent",
+                    row.name, row.listed_files, row.workspace_export_candidates,
+                    row.present_size_matched, row.staged_files, row.missing_files,
                     row.present_size_mismatch, row.held_files,
                     row.unresolved_provider_items, row.historical_absent
                 );
@@ -1183,6 +1201,70 @@ fn reconcile_published(
 
 /// Advance at most one chunk of a source. A failure stays confined to this
 /// source for this pass, while other healthy providers get their turn.
+/// Execute at most one non-resumable Workspace export in the same global
+/// round-robin. Reserve the entire possible byte ceiling BEFORE contacting
+/// Google; unused bytes are deliberately NOT refunded.
+fn advance_workspace_source(
+    cfg: &Config,
+    pending: &mut Pending,
+    budget: &mut u64,
+    start: Instant,
+    time_limit: Duration,
+) -> Result<bool> {
+    if pending.export_index >= pending.exports.len() {
+        return Ok(false);
+    }
+    let remaining = time_limit.saturating_sub(start.elapsed());
+    if remaining < Duration::from_secs(8) {
+        return Ok(false);
+    }
+    let token_file = match &pending.source.backend {
+        Backend::GoogleWorkspace { token_file, .. } => token_file,
+        _ => bail!("Workspace export queue/backend mismatch"),
+    };
+    let item = &pending.exports[pending.export_index];
+    let rate = cfg.scheduler.bandwidth_kib;
+    let seconds = remaining.as_secs().saturating_sub(4);
+    let cap = (*budget)
+        .min(drive_workspace::GOOGLE_EXPORT_MAX_BYTES)
+        .min(rate.saturating_mul(1024).saturating_mul(seconds));
+    if cap == 0 {
+        return Ok(false);
+    }
+    let target = pending.source.destination.join(safe_relative(&item.relative_destination)?);
+    ensure!(!target.exists(), "Workspace destination appeared before export");
+
+    *budget -= cap;
+    let stage_root = cfg.archive_root.join(".syncarium").join("export-staging");
+    fs::create_dir_all(&stage_root)?;
+    no_symlink_ancestors(&stage_root)?;
+    let staging = NamedTempFile::new_in(&stage_root)?;
+    let len = drive_workspace::export_small(
+        token_file, item, staging.path(),
+        drive_workspace::ExportLimits {
+            max_bytes: cap, rate_kib: rate,
+            deadline: remaining.saturating_sub(Duration::from_secs(2)),
+        }
+    )?;
+    ensure!(len > 0 && len <= cap, "Workspace export exceeded reserved budget");
+
+    let completed = Item {
+        path: item.relative_destination.clone(),
+        size: len,
+        version: item.version_key().to_owned(),
+        url: None,
+        sha256: None,
+        object_id: None,
+        md5: None,
+    };
+    publish(
+        &cfg.archive_root, &pending.source.name, staging.path(), None,
+        &pending.source.destination, &completed
+    )?;
+    pending.export_index += 1;
+    Ok(true)
+}
+
 fn advance_source(
     cfg: &Config,
     pending: &mut Pending,
@@ -1191,8 +1273,11 @@ fn advance_source(
     start: Instant,
     time_limit: Duration,
 ) -> Result<bool> {
-    if pending.index >= pending.files.len() || pending.circuit_open {
+    if pending.circuit_open {
         return Ok(false);
+    }
+    if pending.index >= pending.files.len() {
+        return advance_workspace_source(cfg, pending, budget, start, time_limit);
     }
     let item = &pending.files[pending.index];
     let relative = safe_relative(&item.path)?;
@@ -1317,10 +1402,12 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
             issues.push(message);
         }
         let items = listing.files;
+        let exports = listing.exports;
         let observed = match inventory::observe(
             &cfg.archive_root,
             &source.name,
-            items.iter().map(|item| item.path.as_str()),
+            items.iter().map(|item| item.path.as_str())
+                .chain(exports.iter().map(|item| item.relative_destination.as_str())),
             execute,
         ) {
             Ok(result) => result,
@@ -1384,11 +1471,33 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
             }
         }
         files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.path.cmp(&b.1.path)));
-        println!("{}: {} pending item(s)", source.name, files.len());
+        let mut export_queue = Vec::new();
+        for candidate in exports {
+            let target = source.destination.join(safe_relative(&candidate.relative_destination)?);
+            if target.exists() {
+                if let Err(error) = receipts::check_export_target(
+                    &cfg.archive_root, &source.name,
+                    &candidate.relative_destination, candidate.version_key(), &target
+                ) {
+                    let message = format!(
+                        "{}: existing Workspace export held for {}: {error:#}",
+                        source.name, candidate.relative_destination
+                    );
+                    eprintln!("ITEM HELD: {message}");
+                    issues.push(message);
+                }
+            } else {
+                export_queue.push(candidate);
+            }
+        }
+        println!("{}: {} pending binary item(s), {} pending Workspace export(s)",
+            source.name, files.len(), export_queue.len());
         queues.push(Pending {
             source: source.clone(),
             files: files.into_iter().map(|(_, item)| item).collect(),
             index: 0,
+            exports: export_queue,
+            export_index: 0,
             consecutive_failures: 0,
             circuit_open: false,
         });
@@ -1439,10 +1548,11 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
                     any |= progress;
                 }
                 Err(error) => {
-                    let item = pending
-                        .files
-                        .get(pending.index)
-                        .map_or("<unknown>", |item| item.path.as_str());
+                    let item = pending.files.get(pending.index)
+                        .map(|item| item.path.as_str())
+                        .or_else(|| pending.exports.get(pending.export_index)
+                            .map(|item| item.relative_destination.as_str()))
+                        .unwrap_or("<unknown>");
                     let message = format!(
                         "{}: download held for {}: {error:#}",
                         pending.source.name, item
@@ -1552,6 +1662,8 @@ mod tests {
                 md5: None,
             }).collect(),
             index: 0,
+            exports: Vec::new(),
+            export_index: 0,
             consecutive_failures: 0,
             circuit_open: false,
         };
