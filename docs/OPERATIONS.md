@@ -6,12 +6,13 @@
 syncarium --config ~/.config/syncarium/config.toml doctor
 syncarium --config ~/.config/syncarium/config.toml plan
 syncarium --config ~/.config/syncarium/config.toml status
+syncarium --config ~/.config/syncarium/config.toml status --json
 systemctl --user status syncarium.timer
 systemctl --user status syncarium.service
 journalctl --user -u syncarium.service -n 100 --no-pager
 ```
 
-`plan` contacts enabled source APIs for metadata. It **never downloads file payload**.
+`plan` contacts enabled source APIs for metadata. It **never downloads file payload**. `status` inspects local checkpoint manifests without contacting any cloud service. Its staged-byte totals are **not** an estimate of completed archive coverage.
 
 ## Start exactly one controlled run
 

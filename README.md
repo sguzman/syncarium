@@ -17,6 +17,7 @@ The core scheduler, transfer logic, checkpointing, HTTP implementation, command-
 - Weighted scheduling is **not yet implemented**; current code rotates starting sources each run and interleaves one chunk per source.
 - **Fault isolation:** an expired/failed source listing or an invalid individual checkpoint does not suppress healthy sources. The pass still reports failure (nonzero exit) if any source or file was held.
 - Preserve completed chunk data under **/drive/.syncarium/partials**, with a JSON checkpoint and last-chunk SHA-256 check.
+- **Local progress inspection:** `syncarium status` and `syncarium status --json` report staged bytes and partial file counts without contacting cloud accounts.
 - Atomic publication of a completed file via a **no-clobber hard link**. Interrupted chunks do not replace completed chunks. Local destination files are immutable.
 - Source metadata/version changes halt resumption rather than silently stitching together two versions.
 - No passwords, tokens, local data, or file manifests containing signed URLs in this public repository.

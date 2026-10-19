@@ -57,9 +57,24 @@ destination = "{}"
             String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
         if attempt < 2 {
             assert!(!dest.join("large.bin").exists(), "partial must not be published");
+            let status = Command::new(executable)
+                .arg("--config").arg(&config_path).args(["status", "--json"])
+                .output().expect("local-only status starts");
+            assert!(status.status.success(),
+                "status: {}", String::from_utf8_lossy(&status.stderr));
+            let progress: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+            assert_eq!(progress["partial_files"], 1);
+            assert_eq!(progress["sources"][0]["committed_bytes"],
+                (attempt as u64 + 1) * 1024 * 1024);
         }
     }
     assert_eq!(fs::read(dest.join("large.bin")).unwrap(), payload);
+    let status = Command::new(executable)
+        .arg("--config").arg(&config_path).args(["status", "--json"])
+        .output().unwrap();
+    assert!(status.status.success());
+    let progress: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(progress["partial_files"], 0);
 
     // The source may disappear, but a completed archived file must remain untouched.
     fs::remove_file(source.join("large.bin")).unwrap();

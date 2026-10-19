@@ -32,8 +32,12 @@ enum Action {
     Plan,
     /// Default is preview; --execute is required to download.
     Run { #[arg(long)] execute: bool },
-    /// Print local state paths; no cloud calls.
-    Status,
+    /// Inspect durable staged progress locally (no cloud calls).
+    Status {
+        /// Emit machine-readable JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -94,6 +98,23 @@ struct HttpEntry {
 struct Rotation {
     next: usize,
 }
+
+#[derive(Serialize)]
+struct SourceProgress {
+    name: String,
+    enabled: bool,
+    partial_files: u64,
+    committed_bytes: u64,
+    outstanding_bytes_in_partials: u64,
+}
+
+#[derive(Serialize)]
+struct StatusReport {
+    archive_root: String,
+    partial_files: u64,
+    committed_bytes: u64,
+    sources: Vec<SourceProgress>,
+}
 struct Pending {
     source: Source,
     files: Vec<Item>,
@@ -115,13 +136,108 @@ fn main() -> Result<()> {
             println!("Archive root: {}", cfg.archive_root.display());
             println!("No cloud connections or downloads attempted.");
         }
-        Action::Status => {
-            println!("Archive: {}", cfg.archive_root.display());
-            println!("Checkpoint directory: {}", cfg.archive_root.join(".syncarium").display());
-            println!("Read-only status; no transfers attempted.");
-        }
+        Action::Status { json } => status(&cfg, json)?,
         Action::Plan => transfer_pass(&cfg, false)?,
         Action::Run { execute } => transfer_pass(&cfg, execute)?,
+    }
+    Ok(())
+}
+
+/// Read only local staging metadata. Never query a provider or modify a partial.
+fn status(cfg: &Config, json: bool) -> Result<()> {
+    check_mount(cfg)?;
+    let state = cfg.archive_root.join(".syncarium").join("partials");
+    no_symlink_ancestors(&state)?;
+    let mut report = StatusReport {
+        archive_root: cfg.archive_root.display().to_string(),
+        partial_files: 0,
+        committed_bytes: 0,
+        sources: Vec::new(),
+    };
+
+    for source in &cfg.sources {
+        let mut summary = SourceProgress {
+            name: source.name.clone(),
+            enabled: source.enabled,
+            partial_files: 0,
+            committed_bytes: 0,
+            outstanding_bytes_in_partials: 0,
+        };
+        let root = state.join(&source.name);
+        if root.exists() {
+            no_symlink_ancestors(&root)?;
+            for bucket in fs::read_dir(&root)? {
+                let bucket = bucket?;
+                let kind = bucket.file_type()?;
+                ensure!(
+                    kind.is_dir() && !kind.is_symlink(),
+                    "unsafe checkpoint directory: {}",
+                    bucket.path().display()
+                );
+                for entry in fs::read_dir(bucket.path())? {
+                    let entry = entry?;
+                    if entry.path().extension().is_none_or(|ext| ext != "json") {
+                        continue;
+                    }
+                    ensure!(
+                        entry.file_type()?.is_file(),
+                        "unsafe checkpoint entry: {}",
+                        entry.path().display()
+                    );
+                    let cp: Checkpoint = serde_json::from_slice(&fs::read(entry.path())?)
+                        .with_context(|| format!("reading {}", entry.path().display()))?;
+                    ensure!(
+                        cp.source == source.name && cp.committed <= cp.size,
+                        "invalid checkpoint: {}",
+                        entry.path().display()
+                    );
+                    // Every manifest must have a matching .part file.
+                    let part = entry.path().with_extension("part");
+                    ensure!(
+                        part.is_file() && !part.is_symlink(),
+                        "checkpoint missing its partial: {}",
+                        part.display()
+                    );
+                    ensure!(
+                        fs::metadata(&part)?.len() >= cp.committed,
+                        "checkpoint's partial is shorter than committed bytes: {}",
+                        part.display()
+                    );
+                    summary.partial_files = summary.partial_files.checked_add(1)
+                        .context("partial count overflow")?;
+                    summary.committed_bytes = summary.committed_bytes
+                        .checked_add(cp.committed).context("byte count overflow")?;
+                    summary.outstanding_bytes_in_partials = summary
+                        .outstanding_bytes_in_partials
+                        .checked_add(cp.size - cp.committed)
+                        .context("remaining byte count overflow")?;
+                }
+            }
+        }
+        report.partial_files = report.partial_files
+            .checked_add(summary.partial_files).context("total count overflow")?;
+        report.committed_bytes = report.committed_bytes
+            .checked_add(summary.committed_bytes).context("total bytes overflow")?;
+        report.sources.push(summary);
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Archive: {}", report.archive_root);
+        println!("Staged partial files: {}", report.partial_files);
+        println!("Staged committed bytes: {}", report.committed_bytes);
+        for source in &report.sources {
+            println!(
+                "{}: {} partial(s), {} bytes saved, {} bytes remaining in partials{}",
+                source.name,
+                source.partial_files,
+                source.committed_bytes,
+                source.outstanding_bytes_in_partials,
+                if source.enabled { "" } else { " [disabled]" }
+            );
+        }
+        println!("This is staged progress only, not a completed-archive inventory.");
     }
     Ok(())
 }
