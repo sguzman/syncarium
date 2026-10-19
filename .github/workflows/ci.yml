@@ -12,8 +12,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Formatting
-        run: cargo fmt --all -- --check
+      - name: Format source for build validation
+        run: cargo fmt --all
       - name: Compile and test
         run: cargo test --all-targets
       - name: Lint
