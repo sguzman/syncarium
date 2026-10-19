@@ -936,7 +936,7 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
             // Without a source revision we cannot safely identify an export.
             let (exports, unversioned): (Vec<_>, Vec<_>) =
                 plan.supported.into_iter()
-                    .partition(|item| item.source_version.is_some());
+                    .partition(|item| !item.version_key().is_empty());
             (Vec::new(), exports, plan.unsupported_google_types + unversioned.len())
         }
         Backend::HttpManifest { manifest } => {
@@ -1204,6 +1204,12 @@ fn reconcile_published(
 /// Execute at most one non-resumable Workspace export in the same global
 /// round-robin. Reserve the entire possible byte ceiling BEFORE contacting
 /// Google; unused bytes are deliberately NOT refunded.
+fn workspace_export_reservation(budget: u64, rate_kib: u64, remaining: Duration) -> u64 {
+    budget.min(drive_workspace::GOOGLE_EXPORT_MAX_BYTES)
+        .min(rate_kib.saturating_mul(1024)
+            .saturating_mul(remaining.as_secs().saturating_sub(4)))
+}
+
 fn advance_workspace_source(
     cfg: &Config,
     pending: &mut Pending,
@@ -1211,6 +1217,24 @@ fn advance_workspace_source(
     start: Instant,
     time_limit: Duration,
 ) -> Result<bool> {
+    advance_workspace_with_transfer(
+        cfg, pending, budget, start, time_limit, drive_workspace::export_small
+    )
+}
+
+/// Testable adapter boundary; production passes the native Google exporter.
+fn advance_workspace_with_transfer<F>(
+    cfg: &Config,
+    pending: &mut Pending,
+    budget: &mut u64,
+    start: Instant,
+    time_limit: Duration,
+    transfer: F,
+) -> Result<bool>
+where
+    F: FnOnce(&Path, &drive_workspace::ExportCandidate,
+        &Path, drive_workspace::ExportLimits) -> Result<u64>,
+{
     if pending.export_index >= pending.exports.len() {
         return Ok(false);
     }
@@ -1224,10 +1248,7 @@ fn advance_workspace_source(
     };
     let item = &pending.exports[pending.export_index];
     let rate = cfg.scheduler.bandwidth_kib;
-    let seconds = remaining.as_secs().saturating_sub(4);
-    let cap = (*budget)
-        .min(drive_workspace::GOOGLE_EXPORT_MAX_BYTES)
-        .min(rate.saturating_mul(1024).saturating_mul(seconds));
+    let cap = workspace_export_reservation(*budget, rate, remaining);
     if cap == 0 {
         return Ok(false);
     }
@@ -1239,7 +1260,7 @@ fn advance_workspace_source(
     fs::create_dir_all(&stage_root)?;
     no_symlink_ancestors(&stage_root)?;
     let staging = NamedTempFile::new_in(&stage_root)?;
-    let len = drive_workspace::export_small(
+    let len = transfer(
         token_file, item, staging.path(),
         drive_workspace::ExportLimits {
             max_bytes: cap, rate_kib: rate,
@@ -1874,6 +1895,104 @@ mod tests {
         assert_eq!(std::fs::read(&part).unwrap(), b"original");
         assert_eq!(std::fs::read(&target).unwrap(), b"otherone");
         assert!(meta.exists());
+    }
+
+    #[test]
+    fn workspace_export_consumes_reserved_global_budget_and_publishes_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("archive");
+        let destination = root.join("workspace");
+        std::fs::create_dir_all(&destination).unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "archive_root = {:?}\n[scheduler]\nbudget_mib = 12\nchunk_mib = 1\nbandwidth_kib = 10240\nrun_seconds = 120\n[[sources]]\nname = \"workspace\"\nkind = \"google_workspace\"\nenabled = true\nremote = \"unused:\"\ntoken_file = {:?}\ndestination = {:?}",
+            root.to_str().unwrap(),
+            tmp.path().join("unused-private-token").to_str().unwrap(),
+            destination.to_str().unwrap()
+        )).unwrap();
+        let source = cfg.sources[0].clone();
+        let candidate = drive_workspace::plan(&serde_json::to_vec(&serde_json::json!([
+            {"id":"example-workspace-id","name":"test",
+             "mimeType":"application/vnd.google-apps.document",
+             "modifiedTime":"2026-10-19T12:00:00Z"}
+        ])).unwrap()).unwrap().supported.remove(0);
+        let relative = candidate.relative_destination.clone();
+        let mut pending = Pending {
+            source, files: Vec::new(), index: 0,
+            exports: vec![candidate], export_index: 0,
+            consecutive_failures: 0, circuit_open: false,
+        };
+        let mut budget = 12 * 1024 * 1024;
+        let initial = budget;
+        let progressed = advance_workspace_with_transfer(
+            &cfg, &mut pending, &mut budget,
+            Instant::now(), Duration::from_secs(120),
+            |_, _, stage, limits| {
+                assert_eq!(limits.max_bytes, 10_000_000);
+                std::fs::write(stage, b"sample").unwrap();
+                Ok(6)
+            }
+        ).unwrap();
+        assert!(progressed);
+        assert_eq!(pending.export_index, 1);
+        assert_eq!(initial - budget, 10_000_000,
+            "unused bytes stay reserved instead of being falsely refunded");
+        let target = destination.join(relative);
+        assert_eq!(std::fs::read(&target).unwrap(), b"sample");
+        receipts::check_export_target(
+            &root, "workspace",
+            pending.exports[0].relative_destination.as_str(),
+            pending.exports[0].version_key(), &target
+        ).unwrap();
+    }
+
+    #[test]
+    fn workspace_reservation_is_hard_capped_by_time_and_global_bytes() {
+        assert_eq!(workspace_export_reservation(100_000_000, 10240,
+            Duration::from_secs(60)), 10_000_000);
+        assert_eq!(workspace_export_reservation(900, 10240,
+            Duration::from_secs(60)), 900);
+        assert_eq!(workspace_export_reservation(100_000_000, 1,
+            Duration::from_secs(6)), 2048);
+        assert_eq!(workspace_export_reservation(1_000_000, 10240,
+            Duration::from_secs(3)), 0);
+    }
+
+    #[test]
+    fn failed_workspace_export_does_not_publish_bytes_or_refund_reservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("archive");
+        let dest = root.join("workspace");
+        std::fs::create_dir_all(&dest).unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "archive_root = {:?}\n[scheduler]\nbudget_mib = 12\nchunk_mib = 1\nbandwidth_kib = 10240\nrun_seconds = 120\n[[sources]]\nname = \"workspace\"\nkind = \"google_workspace\"\nenabled = true\nremote = \"unused:\"\ntoken_file = {:?}\ndestination = {:?}",
+            root.to_str().unwrap(),
+            tmp.path().join("unused-private-token").to_str().unwrap(),
+            dest.to_str().unwrap()
+        )).unwrap();
+        let candidate = drive_workspace::plan(&serde_json::to_vec(&serde_json::json!([
+            {"id":"failure-id","name":"test",
+             "mimeType":"application/vnd.google-apps.spreadsheet",
+             "modifiedTime":"2026-10-19T12:00:00Z"}
+        ])).unwrap()).unwrap().supported.remove(0);
+        let target = dest.join(&candidate.relative_destination);
+        let mut pending = Pending {
+            source: cfg.sources[0].clone(), files: Vec::new(), index: 0,
+            exports: vec![candidate], export_index: 0,
+            consecutive_failures: 0, circuit_open: false,
+        };
+        let mut budget = 12 * 1024 * 1024;
+        let result = advance_workspace_with_transfer(
+            &cfg, &mut pending, &mut budget, Instant::now(),
+            Duration::from_secs(120),
+            |_, _, staging, _| {
+                std::fs::write(staging, b"partial").unwrap();
+                anyhow::bail!("simulated network interruption")
+            }
+        );
+        assert!(result.is_err());
+        assert_eq!(budget, 12 * 1024 * 1024 - 10_000_000);
+        assert_eq!(pending.export_index, 0);
+        assert!(!target.exists());
     }
 
 }
