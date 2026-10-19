@@ -61,3 +61,7 @@ When a file transfer or publication fails, that item's checkpoint is preserved a
 ## Listings consume the run deadline
 
 The configured `run_seconds` includes cloud enumeration. When one provider takes too long to list its files, Syncarium limits that listing to the remaining time and reports sources it could not process. This is deliberate: it never starts a late download beyond the user's allotted window. Enabling multiple sources requires considering their inventory latency as well as transfer speed.
+
+## Detecting missing cloud items over time
+
+Once `run --execute` completes a valid source inventory listing, Syncarium keeps an append-only history of path fingerprints in `/drive/.syncarium/inventories`. A later listing missing any previously observed path reports `COVERAGE WARNING`, even if the cloud provider returns an apparently successful response. `audit --json` exposes `historical_absent` and `historical_ever_seen`. This is a cautious warning: intentional cloud deletion or rename can also cause it. Source deletions **never remove local files or past observation records**. The initial observation ledger does not guarantee all Apple Photos or duplicate Google Drive objects were ever visible.

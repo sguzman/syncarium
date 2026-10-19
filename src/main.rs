@@ -16,6 +16,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
+mod inventory;
+
 #[derive(Parser)]
 #[command(about = "One-way, bandwidth-budgeted archival across independent sources")]
 struct Cli {
@@ -141,6 +143,9 @@ struct AuditSource {
     staged_saved_bytes: u64,
     staged_remaining_bytes: u64,
     held_files: u64,
+    historical_absent: u64,
+    historical_ever_seen: u64,
+    newly_observed: u64,
     error: Option<String>,
 }
 
@@ -218,6 +223,27 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
                 errors += 1;
             }
             Ok(items) => {
+                match inventory::observe(
+                    &cfg.archive_root,
+                    &source.name,
+                    items.iter().map(|item| item.path.as_str()),
+                    false,
+                ) {
+                    Ok(observation) => {
+                        row.historical_absent = observation.absent;
+                        row.historical_ever_seen = observation.ever_seen;
+                        row.newly_observed = observation.new;
+                        if observation.absent > 0 {
+                            errors += 1;
+                        }
+                    }
+                    Err(error) => {
+                        row.error = Some(format!("local inventory ledger: {error:#}"));
+                        errors += 1;
+                        report.sources.push(row);
+                        continue;
+                    }
+                }
                 for item in items {
                     row.listed_files += 1;
                     row.listed_bytes = row.listed_bytes.saturating_add(item.size);
@@ -270,10 +296,10 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
                 println!("{}: listing FAILED: {}", row.name, error);
             } else {
                 println!(
-                    "{}: {} listed, {} size-matched local, {} staged, {} missing, {} mismatched, {} held",
+                    "{}: {} listed, {} size-matched local, {} staged, {} missing, {} mismatched, {} held, {} historically observed but absent",
                     row.name, row.listed_files, row.present_size_matched,
                     row.staged_files, row.missing_files,
-                    row.present_size_mismatch, row.held_files
+                    row.present_size_mismatch, row.held_files, row.historical_absent
                 );
                 println!(
                     "  Pending: {} MiB wholly missing, {} MiB remaining in partials",
@@ -550,7 +576,13 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Vec<Item>> {
             for value in values {
                 let (Some(path), Some(size)) = (
                     value.get("Path").and_then(|x| x.as_str()),
-                    value.get("Size").and_then(|x| x.as_u64())) else { continue };
+                    value.get("Size").and_then(|x| x.as_u64())
+                ) else {
+                    bail!(
+                        "{} returned a file entry without a valid path and nonnegative size;                         refusing incomplete inventory",
+                        source.name
+                    );
+                };
                 // Identity is metadata, not a claim of end-to-end cryptographic verification.
                 let version = serde_json::to_string(&serde_json::json!({
                     "modtime":value.get("ModTime"), "id":value.get("ID"),
@@ -839,6 +871,32 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
                 continue;
             }
         };
+        let observed = match inventory::observe(
+            &cfg.archive_root,
+            &source.name,
+            items.iter().map(|item| item.path.as_str()),
+            execute,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let message = format!("{}: inventory ledger failed: {error:#}", source.name);
+                eprintln!("SOURCE FAILED: {message}");
+                issues.push(message);
+                continue;
+            }
+        };
+        if observed.absent > 0 {
+            let message = format!(
+                "{}: {} previously observed remote paths absent from current listing;                 historical inventory retained",
+                source.name, observed.absent
+            );
+            eprintln!("COVERAGE WARNING: {message}");
+            issues.push(message);
+        }
+        println!(
+            "{}: {} observed historically, {} newly observed",
+            source.name, observed.ever_seen, observed.new
+        );
         let mut files = Vec::new();
         for item in items {
             let target = source.destination.join(safe_relative(&item.path)?);

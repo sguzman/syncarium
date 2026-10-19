@@ -89,8 +89,21 @@ destination = "{}"
     let another = Command::new(executable)
         .arg("--config").arg(&config_path).args(["run", "--execute"])
         .output().unwrap();
-    assert!(another.status.success());
+    assert!(
+        !another.status.success(),
+        "a formerly listed item disappearing must raise a coverage warning"
+    );
+    assert!(
+        String::from_utf8_lossy(&another.stderr).contains("COVERAGE WARNING"),
+        "must report the disappearing item"
+    );
     assert_eq!(fs::read(dest.join("large.bin")).unwrap(), payload);
+    let audit = Command::new(executable)
+        .arg("--config").arg(&config_path).args(["audit", "--json"])
+        .output().unwrap();
+    assert!(!audit.status.success());
+    let data: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(data["sources"][0]["historical_absent"], 1);
 }
 
 

@@ -64,3 +64,7 @@ The `audit` subcommand inventories every enabled source and compares path and fi
 ## Time budget and source enumeration
 
 The overall `run_seconds` deadline starts **before** provider listing, not after it. Each rclone inventory query is capped by the lesser of 180 seconds or the remaining pass time. An unlisted source is postponed and reported as an issue if the pass is out of time. This avoids a long list of slow cloud sources silently extending a supposedly bounded hourly pass. The process still has normal filesystem and process-shutdown overhead; the systemd service is an additional upper bound.
+
+## Append-only source observation ledger
+
+Successful **executing** passes keep source-path SHA-256 fingerprints under `/drive/.syncarium/inventories/<source>.json`. They are derived from the source name and remote relative path; filenames and credentials are not stored in the ledger. Newly observed paths extend the set. Previously observed but currently missing paths remain recorded, trigger a coverage warning and make the overall pass return nonzero. No source or local files are deleted. Dry-run `plan` and `audit` only read this ledger. A first listing is a **provisional baseline**, not proof of full cloud coverage; upstream APIs may omit unseen photos or duplicate Google Drive objects. Path renames look like a disappearance plus an addition until resolved manually. Do not treat an absent source item as authorization to delete its local archive.

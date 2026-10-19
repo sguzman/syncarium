@@ -18,6 +18,7 @@ The core scheduler, transfer logic, checkpointing, HTTP implementation, command-
 - **Fault isolation:** an expired/failed source listing or an invalid individual checkpoint does not suppress healthy sources. Individual failed transfers are held while other files proceed; a three-failure circuit breaker pauses repeatedly failing backends for the current pass. The pass still reports failure (nonzero exit) if any source or file was held.
 - Preserve completed chunk data under **/drive/.syncarium/partials**, with a JSON checkpoint and last-chunk SHA-256 check.
 - **Local progress inspection:** `syncarium status` and `syncarium status --json` report staged bytes and partial file counts without contacting cloud accounts.
+- **Append-only observation ledger:** each successful executing source listing records SHA-256 fingerprints of every observed remote path. Later listings flag previously seen items that disappear, without deleting local files or erasing the history. This detects some API listing regressions, not unseen content.
 - **Read-only coverage audit:** `syncarium audit [--json]` compares provider listings with local files, separating missing, partial, present-size-matched, and conflicting files. It does not certify content integrity or provider listing completeness.
 - Atomic publication of a completed file via a **no-clobber hard link**. Interrupted chunks do not replace completed chunks. Local destination files are immutable.
 - Source metadata/version changes halt resumption rather than silently stitching together two versions.
