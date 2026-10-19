@@ -666,3 +666,99 @@ fi
     assert!(!dest.join("private-original.heic").exists(),
         "diagnostic must never publish a remote photo");
 }
+
+
+#[cfg(unix)]
+#[test]
+fn resumed_icloud_style_transfer_rejects_changed_remote_bytes_without_losing_checkpoint() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("archive");
+    let destination = root.join("photos");
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir_all(&destination).unwrap();
+    fs::create_dir(&bin_dir).unwrap();
+
+    let remote_file = tmp.path().join("remote-photo.bin");
+    let length = 1_048_584usize; // one 1 MiB chunk, plus eight bytes
+    let original: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
+    fs::write(&remote_file, &original).unwrap();
+
+    // A deliberately untrustworthy provider reports the exact same metadata
+    // for different bytes, so a version comparison alone cannot detect drift.
+    let stub = bin_dir.join("rclone");
+    fs::write(&stub, r#"#!/bin/sh
+if [ "$1" = "lsjson" ]; then
+    printf '[{"Path":"photo.bin","Size":1048584,"ModTime":"2026-10-01T00:00:00Z","ID":"same-provider-id"}]'
+elif [ "$1" = "cat" ]; then
+    shift
+    shift
+    off=0
+    count=0
+    while [ "$#" -gt 1 ]; do
+        case "$1" in
+            --offset) off="$2" ;;
+            --count) count="$2" ;;
+        esac
+        shift
+        shift
+    done
+    dd if="$SYNCARIUM_TEST_PHOTO" iflag=skip_bytes,count_bytes skip="$off" count="$count" status=none
+else
+    exit 17
+fi
+"#).unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "photos"
+kind = "rclone"
+enabled = true
+remote = "fake:"
+destination = "{}"
+"#, root.display(), destination.display())).unwrap();
+
+    let cli = |command: &[&str]| Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config).args(command)
+        .env("PATH", format!("{}:{}", bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()))
+        .env("SYNCARIUM_TEST_PHOTO", &remote_file)
+        .output().unwrap();
+
+    let first = cli(&["run", "--execute"]);
+    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    assert!(!destination.join("photo.bin").exists());
+    let before = cli(&["status", "--json"]);
+    assert!(before.status.success());
+    let first_status: serde_json::Value = serde_json::from_slice(&before.stdout).unwrap();
+    assert_eq!(first_status["committed_bytes"], 1_048_576);
+
+    fs::write(&remote_file, vec![42u8; length]).unwrap();
+    let drift = cli(&["run", "--execute"]);
+    assert!(!drift.status.success(), "a changed remote last chunk must be held");
+    assert!(String::from_utf8_lossy(&drift.stderr).contains("remote resume overlap differs"));
+    assert!(!destination.join("photo.bin").exists());
+    let after = cli(&["status", "--json"]);
+    assert!(after.status.success());
+    let held_status: serde_json::Value = serde_json::from_slice(&after.stdout).unwrap();
+    assert_eq!(held_status["committed_bytes"], 1_048_576,
+        "failed overlap must preserve all previously committed local bytes");
+
+    fs::write(&remote_file, &original).unwrap();
+    let resumed = cli(&["run", "--execute"]);
+    assert!(resumed.status.success(), "{}", String::from_utf8_lossy(&resumed.stderr));
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains("RESUME CHECK"));
+    assert_eq!(fs::read(destination.join("photo.bin")).unwrap(), original);
+    let verified = cli(&["verify", "--source", "photos", "--json"]);
+    assert!(verified.status.success(), "{}", String::from_utf8_lossy(&verified.stderr));
+}
