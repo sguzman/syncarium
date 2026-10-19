@@ -21,6 +21,7 @@ mod drive_collisions;
 mod drive_recovery;
 mod drive_id;
 mod drive_workspace;
+mod provider_probe;
 mod receipts;
 
 #[derive(Parser)]
@@ -39,6 +40,16 @@ enum Action {
     Plan,
     /// Default is preview; --execute is required to download.
     Run { #[arg(long)] execute: bool },
+    /// Validate provider byte-offset and count behavior without archiving data.
+    /// Downloads 192 KiB only with explicit --execute.
+    ProbeRange {
+        /// Exact configured rclone source name to diagnose.
+        #[arg(long)]
+        source: String,
+        /// Explicit opt-in to contact the source and read sample bytes.
+        #[arg(long)]
+        execute: bool,
+    },
     /// Inventory Google Workspace exports and identify unsupported native types.
     /// This is metadata-only; it never downloads export content.
     DriveWorkspacePlan {
@@ -265,6 +276,8 @@ fn main() -> Result<()> {
         Action::Status { json } => status(&cfg, json)?,
         Action::Verify { source, json } => receipts::verify(&cfg, source.as_deref(), json)?,
         Action::Audit { json } => audit(&cfg, json)?,
+        Action::ProbeRange { source, execute } =>
+            provider_probe::probe(&cfg, &source, execute)?,
         Action::DriveCollisions { remote, json } => {
             check_mount(&cfg)?;
             drive_collisions(&remote, json)?;
