@@ -193,17 +193,18 @@ pub(crate) fn plan_recovery_json(raw: &[u8]) -> Result<RecoveryPlan> {
         let version = format!("id={};mtime={};md5={};size={:?}",
             hash, obj.modified_time.as_deref().unwrap_or(""),
             md5.as_deref().unwrap_or(""), size);
+        let reason = if colliding_file_ids.contains(&id) {
+            "colliding_output_name"
+        } else {
+            "descendant_of_ambiguous_folder"
+        };
         items.push(RecoveryItem {
             object_id: id,
             md5,
             version,
             object_fingerprint: hash,
             relative_destination,
-            reason: if colliding_file_ids.contains(&id) {
-                "colliding_output_name"
-            } else {
-                "descendant_of_ambiguous_folder"
-            },
+            reason,
             source_size: size,
         });
     }
