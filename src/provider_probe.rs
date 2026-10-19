@@ -6,7 +6,6 @@
 //! command never creates checkpoints, receipts or archive publications.
 use anyhow::{bail, ensure, Context, Result};
 use std::fs;
-use std::path::Path;
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -21,7 +20,7 @@ fn is_rclone(source: &Source) -> bool {
     matches!(source.backend, Backend::Rclone { .. })
 }
 
-fn select_item<'a>(items: &'a [Item]) -> Result<&'a Item> {
+fn select_item(items: &[Item]) -> Result<&Item> {
     items.iter().find(|item| item.size >= MIN_ITEM_SIZE)
         .context("no provider-listed file large enough for overlapping range probe (128 KiB required)")
 }
