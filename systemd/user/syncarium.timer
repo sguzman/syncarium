@@ -1,0 +1,11 @@
+[Unit]
+Description=Run one bounded Syncarium pass hourly
+
+[Timer]
+OnCalendar=*-*-* *:10:00
+Persistent=false
+AccuracySec=1min
+Unit=syncarium.service
+
+[Install]
+WantedBy=timers.target

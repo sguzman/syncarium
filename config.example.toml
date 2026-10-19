@@ -1,0 +1,40 @@
+# Copy to ~/.config/syncarium/config.toml and edit locally.
+# Everything is OFF until you explicitly set enabled=true per source
+# AND enable the systemd timer or run with --execute.
+archive_root = "/drive"
+required_mount = "/drive"
+
+[scheduler]
+budget_mib = 128
+chunk_mib = 8
+bandwidth_kib = 512
+run_seconds = 900
+
+[[sources]]
+name = "google-drive"
+kind = "rclone"
+enabled = false
+remote = "gdrive:"
+destination = "/drive/gdrive"
+
+[[sources]]
+name = "icloud-drive"
+kind = "rclone"
+enabled = false
+remote = "icloud:"
+destination = "/drive/icloud/drive"
+
+[[sources]]
+name = "icloud-photos"
+kind = "rclone"
+enabled = false
+remote = "icloudphotos:PrimarySync/All Photos"
+destination = "/drive/icloud/photos/primary"
+
+# Example non-rclone source:
+# [[sources]]
+# name = "example-http"
+# kind = "http_manifest"
+# enabled = false
+# manifest = "/home/USERNAME/.config/syncarium/http-manifest.json"
+# destination = "/drive/other-service"

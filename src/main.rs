@@ -52,7 +52,6 @@ struct Scheduler {
     run_seconds: u64,
 }
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Source {
     name: String,
     enabled: bool,
@@ -179,6 +178,8 @@ fn safe_relative(path: &str) -> Result<PathBuf> {
     ensure!(!path.is_empty() && !path.contains('\\') && !path.chars().any(char::is_control),
         "unsafe relative path");
     let parsed = Path::new(path);
+    ensure!(!path.split('/').any(|part| part.is_empty() || part == "." || part == ".."),
+        "empty or traversing component");
     ensure!(!parsed.is_absolute() && parsed.components().all(|c| matches!(c, Component::Normal(_))),
         "unsafe path from source");
     Ok(parsed.to_path_buf())
@@ -377,7 +378,8 @@ fn download_range(source: &Source, item: &Item, offset: u64, count: u64,
             let max_rate = rate_kib.saturating_mul(1024);
             let mut buffer = [0u8; 16 * 1024];
             while received < count {
-                let n = response.read(&mut buffer[..(count - received).min(buffer.len() as u64) as usize])?;
+                let take = (count - received).min(buffer.len() as u64) as usize;
+                let n = response.read(&mut buffer[..take])?;
                 ensure!(n != 0, "HTTP response ended before requested range completed");
                 file.write_all(&buffer[..n])?;
                 received += n as u64;

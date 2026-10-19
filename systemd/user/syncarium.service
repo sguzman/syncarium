@@ -1,0 +1,12 @@
+[Unit]
+Description=Syncarium bounded downstream cloud archive
+ConditionPathIsMountPoint=/drive
+ConditionPathIsReadWrite=/drive
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/syncarium --config %h/.config/syncarium/config.toml run --execute
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=20min
+NoNewPrivileges=true

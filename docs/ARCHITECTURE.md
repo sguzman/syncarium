@@ -1,0 +1,57 @@
+# Architecture and invariants
+
+## Topology
+
+```text
+systemd user timer (hourly, disabled until manually enabled)
+    → Syncarium (Rust, single process, exclusive lock)
+        → TOML source registry
+        → adapters: native HTTPS or optional rclone CLI
+        → interleaved round-robin, one chunk per source at a time
+        → /drive/.syncarium/partials/<source>/<hash-prefix>/
+        → atomic, no-clobber hard link to each destination
+```
+
+An adapter must provide (1) a complete list of source items and version/size, and (2) an exact byte-range reader. It must never be granted a write API against the remote. Native HTTPS works for manifest-defined objects with functioning `Range` / `206` support. The compatibility adapter uses `rclone lsjson` and `rclone cat --offset --count`. Rust orchestrates all transfer and state logic.
+
+## Explicit safety invariants
+
+1. No upload, reverse synchronization, remote mutation or delete operation exists in the runtime.
+2. Existing destination files are never overwritten. Once archived, a source disappearing does not remove its local copy.
+3. Fail closed when the configured external archive mount disappears or becomes read-only. Fail closed on symlink ancestors and traversal paths.
+4. A file is published **only when its advertised length has been downloaded**; publish uses a no-clobber hard link. Staging state and files live on the destination filesystem.
+5. Exactly **one active transfer** inside a Syncarium pass. The process holds an exclusive local lock; the two old projects are external and cannot be locked by this process.
+6. Every attempted range decrements the single global **payload budget**. API listing overhead, HTTP headers, retried chunks, and authentication requests are outside the exact cap.
+7. Remote size or source-version changes cause the staged file to be held for inspection rather than silently concatenated. The version identifier is only as strong as the backend metadata.
+8. Global scheduling alternates sources after each chunk, rotating the first eligible source on each new run. Full weighted fairness is not yet available.
+
+## Checkpoint protocol
+
+Each source-item path is mapped to a SHA-256-keyed pair of files: `.part` and `.json`. The JSON stores advertised total size, source version, committed prefix length, and the SHA-256 of the last completed chunk. A request downloads a range into a separate temporary file. After exact byte-length validation:
+
+1. Append its bytes to `.part`.
+2. Flush/sync the data.
+3. Atomically update the checkpoint manifest.
+4. On restart, discard only trailing bytes after the last committed checkpoint.
+5. Verify the recorded last chunk. Resume the next offset.
+6. At exactly total size, hard-link the partial to the final destination without replacing an existing file. Only then remove staging.
+
+A failure can leave an orphaned partial if it occurs at an unlucky step. Fail closed and report the orphan; do not silently discard earlier progress. The current implementation verifies only the **last saved chunk**, not the entire file against a provider hash. Adding full independent hash verification and append-only provenance manifests is roadmap work.
+
+## Current known deficits
+
+- Google Drive duplicate-named objects, special Google Docs exports and dangling shortcuts need ID-aware adapters; ordinary rclone path listings cannot guarantee completeness.
+- Apple Photos album hierarchy, Live Photo paired-media handling, shared library coverage, source listing completeness and range support remain to be verified.
+- A source changing while the current 8 MiB ranged request is being served cannot always be detected without stable ETags or provider-specific immutable IDs.
+- HTTP source URL integrity depends on accurate local manifest versions; only HTTPS URLs are accepted.
+- This early implementation scans enabled source inventories each run. For very large cloud libraries it may burn time on listings. Persisted efficient inventories and per-source cursors are future work.
+- POSIX symlink checks are best-effort against concurrent malicious filesystem mutation. Do not execute Syncarium on directories writable by untrusted local users.
+- Runtime version, state schema and migration still need semantic versioning and compatibility controls.
+
+## Why not simply use rclone sync?
+
+`rclone sync` propagates remote deletions; archive safety explicitly forbids that. `rclone copy` is one-way, but traditional interrupted transfers do not automatically guarantee byte-accurate cross-invocation chunk checkpoints for all backends. Syncarium therefore wraps read-only ranged transfers with a source-independent checkpoint protocol.
+
+## Long-term backend roadmap
+
+Native Rust HTTP is implemented. Apache OpenDAL has a Rust Google Drive service, but authentication and duplicate-file IDs must be handled correctly before declaring feature equivalence. An older OpenDAL iCloud Drive backend is not proof of current iCloud Photos support. Use a separately-tested native adapter when its completeness and security match or exceed the bridge.
