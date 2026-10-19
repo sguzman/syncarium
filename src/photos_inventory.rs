@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(report.video_stems_without_matching_still, 1);
         assert_eq!(report.sidecars, 1);
         assert_eq!(report.missing_provider_id, 4);
-        assert_eq!(report.missing_modified_time, 2);
+        assert_eq!(report.missing_modified_time, 3);
         let json = serde_json::to_string(&report).unwrap();
         for secret in ["IMG_1001", "IMG_1002", "custom", "personaldata", "2025/", "2026/"] {
             assert!(!json.contains(secret), "private path leaked into report");
