@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Per Google Drive API, files.export output is capped at 10 MB.
-const GOOGLE_EXPORT_MAX_BYTES: u64 = 10_000_000;
+pub(crate) const GOOGLE_EXPORT_MAX_BYTES: u64 = 10_000_000;
 const NATIVE_PREFIX: &str = "application/vnd.google-apps.";
 
 #[derive(Deserialize)]
@@ -35,8 +35,9 @@ pub(crate) struct ExportCandidate {
     /// Never serialized or written into public repo/logs.
     #[serde(skip_serializing)]
     pub(crate) object_id: String,
-    /// Some Google Workspace inventory objects omit modification metadata.
-    /// This does NOT pin an immutable export revision.
+    #[serde(skip_serializing)]
+    pub(crate) source_version: Option<String>,
+    /// This indicates metadata presence, not an immutable snapshot.
     pub(crate) source_version_known: bool,
     pub(crate) object_fingerprint: String,
     pub(crate) relative_destination: String,
@@ -44,6 +45,12 @@ pub(crate) struct ExportCandidate {
     pub(crate) export_mime: &'static str,
     /// No exported size/MD5 is known until the actual export.
     pub(crate) size_known_before_export: bool,
+}
+
+impl ExportCandidate {
+    pub(crate) fn version_key(&self) -> &str {
+        self.source_version.as_deref().unwrap_or("")
+    }
 }
 
 #[derive(Serialize)]
@@ -86,6 +93,7 @@ pub(crate) fn plan(raw: &[u8]) -> Result<ExportPlan> {
             supported.push(ExportCandidate {
                 object_id: obj.id,
                 source_version_known: obj.modified_time.is_some(),
+                source_version: obj.modified_time,
                 object_fingerprint: hash.clone(),
                 relative_destination: format!(
                     "workspace-exports/{}/id-{hash}{extension}", &hash[..2]

@@ -127,6 +127,33 @@ pub(crate) fn record(
     Ok(())
 }
 
+/// Workspace outputs must have a receipt from this source revision. A local
+/// file with no receipt or an old revision is a conflict, not a success.
+/// Rehashing is intentionally left to the explicit disk-wide verify command.
+pub(crate) fn check_export_target(
+    root: &Path,
+    source: &str,
+    relative: &str,
+    source_version: &str,
+    target: &Path,
+) -> Result<()> {
+    ensure!(!source_version.is_empty(), "Workspace source revision not recorded");
+    safe_relative(relative)?;
+    no_symlink_ancestors(target)?;
+    let metadata = fs::symlink_metadata(target)?;
+    ensure!(metadata.file_type().is_file(), "Workspace output is not a regular file");
+    let receipt_file = receipt_path(root, source, relative);
+    no_symlink_ancestors(&receipt_file)?;
+    let record: Receipt = serde_json::from_slice(&fs::read(receipt_file)
+        .context("Workspace output has no matching Syncarium receipt")?)?;
+    ensure!(record.format == FORMAT && record.source == source
+        && record.path == relative && record.source_version == source_version,
+        "Workspace revision changed or receipt does not match");
+    ensure!(record.size == metadata.len(),
+        "Workspace output size differs from receipt");
+    Ok(())
+}
+
 /// Explicit, read-only disk integrity inspection. Does not read cloud APIs,
 /// copy archive objects, or turn old unreceipted files into verified ones.
 pub(crate) fn verify(cfg: &Config, selected: Option<&str>, json: bool) -> Result<()> {

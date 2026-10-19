@@ -124,6 +124,8 @@ enum Backend {
     HttpManifest { manifest: PathBuf },
     /// Immutable Google IDs, native Rust ranged REST reads; disabled by default.
     GoogleDriveIds { remote: String, token_file: PathBuf },
+    /// Explicitly opt-in single-response exports of Google-native documents.
+    GoogleWorkspace { remote: String, token_file: PathBuf },
 }
 #[derive(Clone, Debug)]
 struct Item {
@@ -195,6 +197,7 @@ struct AuditSource {
     staged_saved_bytes: u64,
     staged_remaining_bytes: u64,
     held_files: u64,
+    workspace_export_candidates: u64,
     unresolved_provider_items: u64,
     historical_absent: u64,
     historical_ever_seen: u64,
@@ -210,6 +213,7 @@ struct AuditReport {
 }
 struct Listing {
     files: Vec<Item>,
+    exports: Vec<drive_workspace::ExportCandidate>,
     /// Provider-visible objects not eligible for bounded, verified transfer.
     unresolved: usize,
 }
@@ -218,6 +222,8 @@ struct Pending {
     source: Source,
     files: Vec<Item>,
     index: usize,
+    exports: Vec<drive_workspace::ExportCandidate>,
+    export_index: usize,
     consecutive_failures: u8,
     circuit_open: bool,
 }
@@ -225,7 +231,11 @@ struct Pending {
 const MAX_CONSECUTIVE_ITEM_FAILURES: u8 = 3;
 
 fn hold_failed_item(queue: &mut Pending) {
-    queue.index = queue.index.saturating_add(1);
+    if queue.index < queue.files.len() {
+        queue.index = queue.index.saturating_add(1);
+    } else {
+        queue.export_index = queue.export_index.saturating_add(1);
+    }
     queue.consecutive_failures = queue.consecutive_failures.saturating_add(1);
     if queue.consecutive_failures >= MAX_CONSECUTIVE_ITEM_FAILURES {
         queue.circuit_open = true;
@@ -278,7 +288,9 @@ fn drive_workspace_plan(
         .find(|src| src.name == source_name)
         .with_context(|| format!("Google Drive source '{source_name}' not configured"))?;
     let remote = match &source.backend {
-        Backend::Rclone { remote } | Backend::GoogleDriveIds { remote, .. } => remote.as_str(),
+        Backend::Rclone { remote }
+        | Backend::GoogleDriveIds { remote, .. }
+        | Backend::GoogleWorkspace { remote, .. } => remote.as_str(),
         Backend::HttpManifest { .. } => bail!("Workspace planning requires Google Drive source"),
     };
     ensure!(source.destination.is_dir(), "archive destination must exist");
@@ -330,7 +342,8 @@ fn drive_recovery_plan(
         .with_context(|| format!("Google Drive source '{source_name}' not configured"))?;
     let remote = match &source.backend {
         Backend::Rclone { remote } => remote.as_str(),
-        Backend::GoogleDriveIds { remote, .. } => remote.as_str(),
+        Backend::GoogleDriveIds { remote, .. }
+        | Backend::GoogleWorkspace { remote, .. } => remote.as_str(),
         Backend::HttpManifest { .. } => bail!("Drive recovery requires an rclone source"),
     };
     ensure!(
@@ -660,7 +673,8 @@ fn validate(cfg: &Config) -> Result<()> {
             Backend::Rclone { remote } =>
                 ensure!(!remote.is_empty() && remote.contains(':') && !remote.contains('\n'),
                     "{} needs an rclone remote:path", s.name),
-            Backend::GoogleDriveIds { remote, token_file } => {
+            Backend::GoogleDriveIds { remote, token_file }
+            | Backend::GoogleWorkspace { remote, token_file } => {
                 ensure!(!remote.is_empty() && remote.contains(':') && !remote.contains('\n'),
                     "{} needs a Google rclone remote", s.name);
                 ensure!(token_file.is_absolute(), "{} needs absolute token_file", s.name);
@@ -854,7 +868,7 @@ fn enforce_listing_floor(source: &Source, count: usize) -> Result<()> {
 }
 
 fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
-    let (mut items, unresolved) = match &source.backend {
+    let (mut items, exports, unresolved) = match &source.backend {
         Backend::Rclone { remote } => {
             let mut command = Command::new("rclone");
             command.args(["lsjson", remote, "--recursive", "--files-only",
@@ -880,7 +894,7 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
                 items.push(Item { path: path.into(), size, version, url: None,
                     sha256: None, object_id: None, md5: None });
             }
-            (items, 0)
+            (items, Vec::new(), 0)
         }
         Backend::GoogleDriveIds { remote, .. } => {
             // Metadata-only enumeration through the already authorized rclone
@@ -891,7 +905,21 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
             ensure!(raw.len() <= 256 * 1024 * 1024,
                 "Google Drive ID listing exceeds 256 MiB limit");
             let plan = drive_recovery::plan_recovery_json(&raw)?;
-            eligible_google_objects(plan)
+            let (items, unresolved) = eligible_google_objects(plan);
+            (items, Vec::new(), unresolved)
+        }
+        Backend::GoogleWorkspace { remote, .. } => {
+            let mut command = Command::new("rclone");
+            command.args(["backend", "query", remote, "trashed = false"]);
+            let raw = command_output_with_timeout(&mut command, listing_timeout)?;
+            ensure!(raw.len() <= 256 * 1024 * 1024,
+                "Google Workspace ID inventory exceeds 256 MiB limit");
+            let plan = drive_workspace::plan(&raw)?;
+            // Without a source revision we cannot safely identify an export.
+            let (exports, unversioned): (Vec<_>, Vec<_>) =
+                plan.supported.into_iter()
+                    .partition(|item| item.source_version.is_some());
+            (Vec::new(), exports, plan.unsupported_google_types + unversioned.len())
         }
         Backend::HttpManifest { manifest } => {
             no_symlink_ancestors(manifest)?;
@@ -900,7 +928,7 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
                 path:e.path, size:e.size, version:e.version, url: Some(e.url),
                 sha256:e.sha256.map(|hash| hash.to_ascii_lowercase()),
                 object_id: None, md5: None
-            }).collect(), 0)
+            }).collect(), Vec::new(), 0)
         }
     };
     let mut seen = HashSet::new();
@@ -921,9 +949,14 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
                 "invalid MD5 for {}", item.path);
         }
     }
-    enforce_listing_floor(source, items.len())?;
+    for candidate in &exports {
+        safe_relative(&candidate.relative_destination)?;
+        ensure!(seen.insert(candidate.relative_destination.clone()),
+            "{} contains duplicate Workspace export destination", source.name);
+    }
+    enforce_listing_floor(source, items.len() + exports.len())?;
     items.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(Listing { files: items, unresolved })
+    Ok(Listing { files: items, exports, unresolved })
 }
 fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
     let stdout = NamedTempFile::new()?;
@@ -953,6 +986,9 @@ fn download_range(source: &Source, item: &Item, offset: u64, count: u64,
                 drive_id::TransferLimits { rate_kib, deadline },
                 staging
             )?;
+        }
+        Backend::GoogleWorkspace { .. } => {
+            bail!("Workspace exports require bounded single-response transport")
         }
         Backend::Rclone { remote } => {
             let path = format!("{}/{}", remote.trim_end_matches('/'), item.path);
@@ -1057,7 +1093,7 @@ fn publish(
     archive_root: &Path,
     source: &str,
     part: &Path,
-    meta: &Path,
+    meta: Option<&Path>,
     destination: &Path,
     item: &Item,
 ) -> Result<()> {
@@ -1082,7 +1118,9 @@ fn publish(
         Ok(()) => {
             sync_directory(target.parent().context("missing target parent")?)?;
             fs::remove_file(part)?;
-            fs::remove_file(meta)?;
+            if let Some(meta) = meta {
+                fs::remove_file(meta)?;
+            }
             sync_directory(part.parent().context("missing staging parent")?)?;
             println!("COMPLETE {}", item.path);
         }
@@ -1173,7 +1211,7 @@ fn advance_source(
     if cp.committed == item.size {
         publish(
             &cfg.archive_root, &pending.source.name,
-            &part, &meta, &pending.source.destination, item,
+            &part, Some(&meta), &pending.source.destination, item,
         )?;
         pending.index += 1;
         return Ok(true);
@@ -1208,7 +1246,7 @@ fn advance_source(
     if cp.committed == item.size {
         publish(
             &cfg.archive_root, &pending.source.name,
-            &part, &meta, &pending.source.destination, item,
+            &part, Some(&meta), &pending.source.destination, item,
         )?;
         pending.index += 1;
     }
@@ -1484,11 +1522,11 @@ mod tests {
             object_id: None,
             md5: None,
         };
-        assert!(publish(tmp.path(), "test", &part, &meta, &destination, &item).is_err());
+        assert!(publish(tmp.path(), "test", &part, Some(&meta), &destination, &item).is_err());
         assert!(!destination.join("file.bin").exists());
         assert!(part.exists(), "bad checksum must preserve the partial");
         item.sha256 = Some(hex::encode(Sha256::digest(b"correct-data")));
-        publish(tmp.path(), "test", &part, &meta, &destination, &item).unwrap();
+        publish(tmp.path(), "test", &part, Some(&meta), &destination, &item).unwrap();
         assert_eq!(std::fs::read(destination.join("file.bin")).unwrap(), b"correct-data");
         assert!(!part.exists());
     }
@@ -1562,11 +1600,11 @@ mod tests {
             object_id: Some("test-google-id".into()),
             md5: Some("00000000000000000000000000000000".into()),
         };
-        assert!(publish(tmp.path(), "test", &part, &meta, &destination, &item).is_err());
+        assert!(publish(tmp.path(), "test", &part, Some(&meta), &destination, &item).is_err());
         assert!(!destination.join(&item.path).exists());
         assert!(part.exists(), "checksum mismatch must preserve staged bytes");
         item.md5 = Some(hex::encode(md5::Md5::digest(b"correct-data")));
-        publish(tmp.path(), "test", &part, &meta, &destination, &item).unwrap();
+        publish(tmp.path(), "test", &part, Some(&meta), &destination, &item).unwrap();
         assert_eq!(std::fs::read(destination.join(&item.path)).unwrap(), b"correct-data");
         assert!(!part.exists());
     }
