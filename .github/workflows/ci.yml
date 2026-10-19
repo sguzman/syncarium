@@ -1,5 +1,11 @@
 name: Rust CI
 
+# Superseded branch commits need not consume scarce CI runners.
+# Keep only the newest push/PR run for each ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
   pull_request:
