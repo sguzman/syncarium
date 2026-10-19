@@ -729,7 +729,8 @@ fn eligible_google_objects(plan: drive_recovery::RecoveryPlan) -> (Vec<Item>, us
             }
         })
         .collect();
-    (eligible, total - eligible.len() + unsupported)
+    let unresolved = total - eligible.len() + unsupported;
+    (eligible, unresolved)
 }
 
 fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
