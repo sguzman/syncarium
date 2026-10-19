@@ -456,3 +456,123 @@ destination = "{}"
     assert!(!destination.join("workspace-exports").exists());
     assert!(!root.join(".syncarium/receipts").exists());
 }
+
+
+#[test]
+fn strict_cloud_history_holds_changed_listing_and_keeps_other_source_healthy() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("archive");
+    let source = tmp.path().join("remote-photos");
+    let healthy = tmp.path().join("remote-other");
+    let photos = root.join("photos");
+    let other = root.join("other");
+    for folder in [&source, &healthy, &photos, &other] {
+        fs::create_dir_all(folder).unwrap();
+    }
+    fs::write(source.join("first.heic"), b"first").unwrap();
+    fs::write(source.join("second.heic"), b"second").unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 2
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "photos"
+kind = "rclone"
+enabled = true
+remote = ":local:{}"
+destination = "{}"
+require_historical_coverage = true
+min_items = 1
+min_total_bytes = 1
+
+[[sources]]
+name = "other"
+kind = "rclone"
+enabled = true
+remote = ":local:{}"
+destination = "{}"
+"#,
+        root.display(), source.display(), photos.display(),
+        healthy.display(), other.display()
+    )).unwrap();
+    let execute = || Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config).args(["run", "--execute"])
+        .output().unwrap();
+
+    let first = execute();
+    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    assert_eq!(fs::read(photos.join("first.heic")).unwrap(), b"first");
+    assert_eq!(fs::read(photos.join("second.heic")).unwrap(), b"second");
+    let ledger = root.join(".syncarium/inventories/photos.json");
+    let initial = fs::read(&ledger).unwrap();
+    let initial_json: serde_json::Value = serde_json::from_slice(&initial).unwrap();
+    assert_eq!(initial_json["hashes"].as_array().unwrap().len(), 2);
+
+    // The provider returns a perfectly valid but incomplete and changed
+    // inventory: one old item missing, one previously unseen one added.
+    fs::remove_file(source.join("second.heic")).unwrap();
+    fs::write(source.join("third.heic"), b"third").unwrap();
+    fs::write(healthy.join("healthy.bin"), b"healthy").unwrap();
+
+    let second = execute();
+    assert!(!second.status.success(), "strict historical gap must report failure");
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains("SOURCE HELD"), "{stderr}");
+    assert!(stderr.contains("previously observed cloud identities missing"), "{stderr}");
+    assert!(!photos.join("third.heic").exists(),
+        "strict source must not download from an incomplete listing");
+    assert_eq!(fs::read(photos.join("second.heic")).unwrap(), b"second",
+        "cloud disappearance must never remove local archives");
+    assert_eq!(fs::read(&ledger).unwrap(), initial,
+        "rejected listing must not persist newly seen identities");
+    assert_eq!(fs::read(other.join("healthy.bin")).unwrap(), b"healthy",
+        "healthy providers should continue even if strict cloud listing was held");
+}
+
+#[test]
+fn minimum_provider_byte_total_rejects_suspiciously_small_listing() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("archive");
+    let remote = tmp.path().join("remote");
+    let dest = root.join("photos");
+    fs::create_dir_all(&remote).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(remote.join("small.bin"), b"tiny").unwrap();
+    fs::write(remote.join("another.bin"), b"small").unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "photos"
+kind = "rclone"
+enabled = true
+remote = ":local:{}"
+destination = "{}"
+min_items = 2
+min_total_bytes = 1000
+"#, root.display(), remote.display(), dest.display()
+    )).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config).args(["run", "--execute"])
+        .output().unwrap();
+    assert!(!result.status.success(), "the byte-size floor must prevent transfers");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("min_total_bytes=1000"), "{stderr}");
+    assert!(!dest.join("small.bin").exists());
+    assert!(!dest.join("another.bin").exists());
+    assert!(!root.join(".syncarium/inventories/photos.json").exists(),
+        "no observations should persist for rejected size inventories");
+}
