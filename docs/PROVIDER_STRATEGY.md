@@ -35,3 +35,7 @@ Provider commands have explicit deadlines and a maximum 256 MiB inventory output
 ## Ranged-read diagnostic gate
 
 An explicit `probe-range --source SOURCE --execute` operation can test the established rclone bridge independently of archive publication. It performs three 64 KiB overlapping reads from a provider-listed file, and compares their overlaps to detect broken offsets. It writes only disposable temporary files. The command never runs as part of routine syncing. A passed probe is a necessary diagnostic signal, **not** proof of cloud library completeness or original-quality media recovery. The Rust reader also limits stdout bytes to a reserved chunk, independent of whether rclone obeys its `--count` option. Both features are covered by offline fake-rclone tests. Live iCloud behavior remains unverified.
+
+## Photo album inventory QA without premature transfer
+
+`photos-inventory --source icloud-photos` provides an entirely no-network preview, and `--fixture /absolute/path` can analyze a private rclone JSON listing offline. A real metadata enumeration is only issued with an explicit `--execute`. Its aggregate report identifies likely still/video filename pairings, ambiguous groups and provider metadata omissions without revealing filenames. These are diagnostic hints rather than proof that Apple returned all original files, edits, bursts, Live Photos or metadata companions; independent verification of the real provider is still required before retiring the existing archival workflow.
