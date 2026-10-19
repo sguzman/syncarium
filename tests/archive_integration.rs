@@ -1033,3 +1033,117 @@ destination = "{}"
     assert_eq!(report["reference_only"], 1);
     assert!(!root.exists());
 }
+
+
+#[test]
+fn local_media_headers_check_is_offline_bounded_and_privacy_preserving() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("archive");
+    let dest = root.join("icloud-photos");
+    fs::create_dir_all(&dest).unwrap();
+    let cfg = tmp.path().join("config.toml");
+    fs::write(&cfg, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "icloud-photos"
+kind = "rclone"
+enabled = false
+remote = "cloud-is-not-configured:"
+destination = "{}"
+"#, root.display(), dest.display())).unwrap();
+    fs::write(dest.join("private-photo.HEIC"), b"\0\0\0\x18ftypheic\0\0\0\0mif1").unwrap();
+    fs::write(dest.join("wrong-extension.heic"), b"\xff\xd8\xff\xe1").unwrap();
+    fs::write(dest.join("private-motion.mov"), b"\0\0\0\x18ftypqt  \0\0\0\0qt  ").unwrap();
+    fs::write(dest.join("not-understood.heif"), b"12345").unwrap();
+    let fixture = tmp.path().join("private-cloud-listing.json");
+    fs::write(&fixture, serde_json::to_vec(&serde_json::json!([
+        {"Path":"private-photo.HEIC","Size":20,"ID":"cloud-private-1"},
+        {"Path":"wrong-extension.heic","Size":4,"ID":"cloud-private-2"},
+        {"Path":"private-motion.mov","Size":20,"ID":"cloud-private-3"},
+        {"Path":"not-understood.heif","Size":5,"ID":"cloud-private-4"},
+        {"Path":"missing-original.jpg","Size":1000,"ID":"cloud-private-5"}
+    ])).unwrap()).unwrap();
+    let run = |execute: bool, limit: usize| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_syncarium"));
+        cmd.arg("--config").arg(&cfg)
+            .args(["photos-headers", "--source", "icloud-photos", "--fixture"])
+            .arg(&fixture).arg("--max-files").arg(limit.to_string()).arg("--json");
+        if execute { cmd.arg("--execute"); }
+        cmd.output().unwrap()
+    };
+    let preview = run(false, 5);
+    assert!(preview.status.success());
+    assert!(String::from_utf8_lossy(&preview.stdout).contains("PREVIEW ONLY"));
+    assert!(!root.join(".syncarium").exists());
+
+    let audit = run(true, 5);
+    assert!(!audit.status.success(), "mismatched and missing media must fail local checks");
+    let value: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(value["checked_files"], 5);
+    assert_eq!(value["signature_matches"], 2);
+    assert_eq!(value["recognized_mismatches"], 1);
+    assert_eq!(value["inconclusive_headers"], 1);
+    assert_eq!(value["missing_files"], 1);
+    assert_eq!(value["eligible_not_checked_due_to_limit"], 0);
+    for name in ["private-photo", "wrong-extension", "missing-original", "cloud-private"] {
+        assert!(!String::from_utf8_lossy(&audit.stdout).contains(name),
+            "media name or provider ID leaked into aggregate report");
+    }
+    assert!(!root.join(".syncarium").exists());
+    assert_eq!(fs::read(dest.join("wrong-extension.heic")).unwrap(), b"\xff\xd8\xff\xe1");
+    let limited = run(true, 1);
+    let counts: serde_json::Value = serde_json::from_slice(&limited.stdout).unwrap();
+    assert_eq!(counts["checked_files"], 1);
+    assert_eq!(counts["eligible_not_checked_due_to_limit"], 4);
+}
+
+#[cfg(unix)]
+#[test]
+fn local_media_headers_refuses_symlinked_archive_files_without_reading_outside_root() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("archive");
+    let dest = root.join("photos");
+    fs::create_dir_all(&dest).unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "photos"
+kind = "rclone"
+enabled = false
+remote = "none:"
+destination = "{}"
+"#, root.display(), dest.display())).unwrap();
+    let private_outside = tmp.path().join("outside-file");
+    fs::write(&private_outside, b"\xff\xd8\xff\xe0").unwrap();
+    symlink(&private_outside, dest.join("photo.jpg")).unwrap();
+    let manifest = tmp.path().join("snapshot.json");
+    fs::write(&manifest, br#"[{"Path":"photo.jpg","Size":4}]"#).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config)
+        .args(["photos-headers", "--source", "photos", "--fixture"])
+        .arg(&manifest)
+        .args(["--max-files", "1", "--execute", "--json"])
+        .output().unwrap();
+    assert!(!result.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["unsafe_or_unreadable_files"], 1);
+    assert_eq!(report["signature_matches"], 0);
+    assert_eq!(fs::read(&private_outside).unwrap(), b"\xff\xd8\xff\xe0");
+    assert!(!root.join(".syncarium").exists());
+}
