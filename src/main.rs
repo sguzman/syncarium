@@ -20,6 +20,7 @@ mod inventory;
 mod drive_collisions;
 mod drive_recovery;
 mod drive_id;
+mod receipts;
 
 #[derive(Parser)]
 #[command(about = "One-way, bandwidth-budgeted archival across independent sources")]
@@ -59,6 +60,13 @@ enum Action {
     /// Audit source-to-local coverage (metadata listing; no file payload downloads).
     Audit {
         /// Print machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rehash files published with local Syncarium SHA-256 receipts (no cloud access).
+    Verify {
+        #[arg(long)]
+        source: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -226,6 +234,7 @@ fn main() -> Result<()> {
             println!("No cloud connections or downloads attempted.");
         }
         Action::Status { json } => status(&cfg, json)?,
+        Action::Verify { source, json } => receipts::verify(&cfg, source.as_deref(), json)?,
         Action::Audit { json } => audit(&cfg, json)?,
         Action::DriveCollisions { remote, json } => {
             check_mount(&cfg)?;
@@ -977,52 +986,33 @@ fn destination_already_archived(target: &Path, item: &Item) -> Result<bool> {
     }
 }
 
-fn publish(part: &Path, meta: &Path, destination: &Path, item: &Item) -> Result<()> {
+fn publish(
+    archive_root: &Path,
+    source: &str,
+    part: &Path,
+    meta: &Path,
+    destination: &Path,
+    item: &Item,
+) -> Result<()> {
     let target = destination.join(safe_relative(&item.path)?);
     no_symlink_ancestors(&target)?;
-    ensure!(
-        fs::metadata(part)?.len() == item.size,
-        "cannot publish incomplete file"
-    );
-    if let Some(expected) = &item.md5 {
-        use md5::Md5;
-        let mut reader = File::open(part)?;
-        let mut hasher = Md5::new();
-        let mut buffer = [0u8; 256 * 1024];
-        loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 { break; }
-            hasher.update(&buffer[..read]);
-        }
-        ensure!(
-            hex::encode(hasher.finalize()) == *expected,
-            "Google Drive whole-file MD5 mismatch for {}; preserving partial",
-            item.path
-        );
-    }
-    if let Some(expected) = &item.sha256 {
-        let mut reader = File::open(part)?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 256 * 1024];
-        loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        ensure!(
-            hex::encode(hasher.finalize()) == *expected,
-            "whole-file SHA-256 mismatch for {}; preserving partial for review",
-            item.path
-        );
-    }
+    ensure!(fs::metadata(part)?.len() == item.size, "cannot publish incomplete file");
+
+    // A single streaming pass produces the independent local SHA-256 receipt
+    // and validates any provider MD5 or SHA-256 before creating a final link.
+    let sha256 = receipts::fingerprint_file(
+        part, item.md5.as_deref(), item.sha256.as_deref(),
+    )?;
     fs::create_dir_all(target.parent().context("missing parent")?)?;
     no_symlink_ancestors(target.parent().context("missing parent")?)?;
+
+    // Prepare a durable receipt before publication. If a crash happens now,
+    // verification sees a missing target instead of inventing successful
+    // publication. Repeated identical preparation is idempotent.
+    receipts::record(archive_root, source, &item.path, &item.version, item.size, &sha256)?;
+
     match fs::hard_link(part, &target) {
         Ok(()) => {
-            // Make the no-clobber destination name durable BEFORE removing
-            // its staging hard link. Otherwise a power loss could lose both.
             sync_directory(target.parent().context("missing target parent")?)?;
             fs::remove_file(part)?;
             fs::remove_file(meta)?;
@@ -1030,12 +1020,13 @@ fn publish(part: &Path, meta: &Path, destination: &Path, item: &Item) -> Result<
             println!("COMPLETE {}", item.path);
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            println!("PRESERVE existing local file {}", item.path);
+            bail!("archive destination appeared during immutable publication; preserving existing file");
         }
         Err(e) => return Err(e.into()),
     }
     Ok(())
 }
+
 /// Advance at most one chunk of a source. A failure stays confined to this
 /// source for this pass, while other healthy providers get their turn.
 fn advance_source(
@@ -1063,7 +1054,10 @@ fn advance_source(
     let (mut cp, part, meta) =
         checkpoint(&cfg.archive_root, &pending.source.name, item, true)?;
     if cp.committed == item.size {
-        publish(&part, &meta, &pending.source.destination, item)?;
+        publish(
+            &cfg.archive_root, &pending.source.name,
+            &part, &meta, &pending.source.destination, item,
+        )?;
         pending.index += 1;
         return Ok(true);
     }
@@ -1095,7 +1089,10 @@ fn advance_source(
     )?;
     store_chunk(&part, &meta, &mut cp, chunk.path())?;
     if cp.committed == item.size {
-        publish(&part, &meta, &pending.source.destination, item)?;
+        publish(
+            &cfg.archive_root, &pending.source.name,
+            &part, &meta, &pending.source.destination, item,
+        )?;
         pending.index += 1;
     }
     Ok(true)
@@ -1358,11 +1355,11 @@ mod tests {
             object_id: None,
             md5: None,
         };
-        assert!(publish(&part, &meta, &destination, &item).is_err());
+        assert!(publish(tmp.path(), "test", &part, &meta, &destination, &item).is_err());
         assert!(!destination.join("file.bin").exists());
         assert!(part.exists(), "bad checksum must preserve the partial");
         item.sha256 = Some(hex::encode(Sha256::digest(b"correct-data")));
-        publish(&part, &meta, &destination, &item).unwrap();
+        publish(tmp.path(), "test", &part, &meta, &destination, &item).unwrap();
         assert_eq!(std::fs::read(destination.join("file.bin")).unwrap(), b"correct-data");
         assert!(!part.exists());
     }
@@ -1436,11 +1433,11 @@ mod tests {
             object_id: Some("test-google-id".into()),
             md5: Some("00000000000000000000000000000000".into()),
         };
-        assert!(publish(&part, &meta, &destination, &item).is_err());
+        assert!(publish(tmp.path(), "test", &part, &meta, &destination, &item).is_err());
         assert!(!destination.join(&item.path).exists());
         assert!(part.exists(), "checksum mismatch must preserve staged bytes");
         item.md5 = Some(hex::encode(md5::Md5::digest(b"correct-data")));
-        publish(&part, &meta, &destination, &item).unwrap();
+        publish(tmp.path(), "test", &part, &meta, &destination, &item).unwrap();
         assert_eq!(std::fs::read(destination.join(&item.path)).unwrap(), b"correct-data");
         assert!(!part.exists());
     }

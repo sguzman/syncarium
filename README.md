@@ -93,3 +93,5 @@ Other already-authorized sources can continue within the same bandwidth budget. 
 - **Power-loss hardening:** durable directory flushes for checkpoint renames and completed hard-link publication, plus safe automatic repair of empty partials left by an interrupted initial checkpoint write. Nonempty or ambiguous orphan state is preserved for investigation.
 
 - **Optional inventory sanity floors:** per-source `min_items` rejects implausibly short listings, useful when a provider temporarily omits thousands of photos. Thresholds are configured manually in private TOML after establishing a baseline.
+
+- **Local SHA-256 receipts:** each newly published file has an immutable receipt recording exactly which local bytes were assembled. `syncarium verify [--source NAME] [--json]` rehashes those files without contacting cloud accounts; preexisting files without receipts are explicitly outside this verification.

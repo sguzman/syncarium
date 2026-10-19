@@ -102,3 +102,7 @@ Publishing now forces the completed destination directory entry to disk before t
 ## Guard against unexpectedly small cloud inventories
 
 After inspecting a known-good source listing, optionally set `min_items` on that source in local TOML (for example, a conservatively low bound for your iCloud Photos library). A later listing below the floor fails **before any state observation or transfers from that source**. The failure is reported in the ordinary source listing error path while other sources continue normally. Do not set a minimum larger than the number of eligible items the adapter actually returns, and do not mistake satisfying this threshold for a full media completeness audit. `plan` and `audit` also detect this condition without downloading files.
+
+## Verify published local archive receipts (no cloud access)
+
+Run `syncarium --config ~/.config/syncarium/config.toml verify` to read and SHA-256 check all previously receipted Syncarium downloads, or add `--source icloud-photos` to check one configured source. Use `--json` for aggregate machine-readable counts. The command reads full local files (potentially **many gigabytes**), so run it deliberately when disk activity is acceptable, not after every hourly pass. It never downloads, uploads, deletes or repairs anything. A nonzero exit indicates missing, mismatched or invalid receipts. Legacy files that predate this receipt feature remain **unverified** until an explicit future provenance migration; they are not automatically certified based on matching names or sizes.

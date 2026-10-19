@@ -271,3 +271,55 @@ min_items = 2
     assert!(!root.join(".syncarium/inventories/photos.json").exists(),
         "rejected inventory must never become a new baseline");
 }
+
+
+#[test]
+fn published_receipts_detect_same_size_local_corruption_without_cloud_calls() {
+    let tmp = tempdir().unwrap();
+    let source = tmp.path().join("remote");
+    let root = tmp.path().join("archive");
+    let dest = root.join("fixture");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(source.join("file.bin"), b"correct-content").unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "fixture"
+kind = "rclone"
+enabled = true
+remote = ":local:{}"
+destination = "{}"
+"#, root.display(), source.display(), dest.display())).unwrap();
+    let bin = env!("CARGO_BIN_EXE_syncarium");
+    let run = Command::new(bin).arg("--config").arg(&config)
+        .args(["run", "--execute"]).output().unwrap();
+    assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+    let check = || Command::new(bin).arg("--config").arg(&config)
+        .args(["verify", "--source", "fixture", "--json"]).output().unwrap();
+    let verified = check();
+    assert!(verified.status.success(), "{}", String::from_utf8_lossy(&verified.stderr));
+    let counts: serde_json::Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert_eq!(counts["sources"][0]["receipts"], 1);
+    assert_eq!(counts["sources"][0]["verified"], 1);
+
+    // This must not require source access: neither receipt nor local archive
+    // is affected by remote deletion after the successful transfer.
+    fs::remove_file(source.join("file.bin")).unwrap();
+    assert!(check().status.success());
+
+    fs::write(dest.join("file.bin"), b"changed-content").unwrap();
+    let corrupted = check();
+    assert!(!corrupted.status.success());
+    let counts: serde_json::Value = serde_json::from_slice(&corrupted.stdout).unwrap();
+    assert_eq!(counts["sources"][0]["mismatched"], 1);
+    assert_eq!(fs::read(dest.join("file.bin")).unwrap(), b"changed-content");
+}
