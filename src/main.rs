@@ -98,6 +98,7 @@ struct Pending {
     source: Source,
     files: Vec<Item>,
     index: usize,
+    failed: bool,
 }
 
 fn main() -> Result<()> {
@@ -427,101 +428,223 @@ fn publish(part: &Path, meta: &Path, destination: &Path, relative: &str, expecte
     }
     Ok(())
 }
+/// Advance at most one chunk of a source. A failure stays confined to this
+/// source for this pass, while other healthy providers get their turn.
+fn advance_source(
+    cfg: &Config,
+    pending: &mut Pending,
+    budget: &mut u64,
+    chunk_limit: u64,
+    start: Instant,
+    time_limit: Duration,
+) -> Result<bool> {
+    if pending.index >= pending.files.len() || pending.failed {
+        return Ok(false);
+    }
+    let item = &pending.files[pending.index];
+    let relative = safe_relative(&item.path)?;
+    let target = pending.source.destination.join(relative);
+    no_symlink_ancestors(&target)?;
+    if target.exists() {
+        pending.index += 1;
+        return Ok(true);
+    }
+    let remaining = time_limit.saturating_sub(start.elapsed());
+    if remaining < Duration::from_secs(8) {
+        return Ok(false);
+    }
+    let (mut cp, part, meta) =
+        checkpoint(&cfg.archive_root, &pending.source.name, item, true)?;
+    if cp.committed == item.size {
+        publish(
+            &part,
+            &meta,
+            &pending.source.destination,
+            &item.path,
+            item.size,
+        )?;
+        pending.index += 1;
+        return Ok(true);
+    }
+    let seconds = remaining.as_secs().saturating_sub(4);
+    let time_budget = cfg.scheduler.bandwidth_kib * 1024 * seconds;
+    let n = (*budget)
+        .min(chunk_limit)
+        .min(item.size - cp.committed)
+        .min(time_budget);
+    if n == 0 {
+        return Ok(false);
+    }
+    // Account for attempted bytes before starting any network operation.
+    *budget -= n;
+    let folder = part.parent().context("missing staged directory")?;
+    let chunk = NamedTempFile::new_in(folder)?;
+    println!(
+        "CHUNK {} {} @{} +{}",
+        pending.source.name, item.path, cp.committed, n
+    );
+    download_range(
+        &pending.source,
+        item,
+        cp.committed,
+        n,
+        cfg.scheduler.bandwidth_kib,
+        remaining.saturating_sub(Duration::from_secs(2)),
+        chunk.path(),
+    )?;
+    store_chunk(&part, &meta, &mut cp, chunk.path())?;
+    if cp.committed == item.size {
+        publish(
+            &part,
+            &meta,
+            &pending.source.destination,
+            &item.path,
+            item.size,
+        )?;
+        pending.index += 1;
+    }
+    Ok(true)
+}
+
 fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
     check_mount(cfg)?;
     let state_root = cfg.archive_root.join(".syncarium");
     let _lock = if execute {
         fs::create_dir_all(&state_root)?;
         no_symlink_ancestors(&state_root)?;
-        let handle = OpenOptions::new().create(true).truncate(false).read(true).write(true)
+        let handle = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
             .open(state_root.join("run.lock"))?;
-        handle.try_lock_exclusive().context("another Syncarium run is active")?;
+        handle
+            .try_lock_exclusive()
+            .context("another Syncarium run is active")?;
         Some(handle)
-    } else { None };
-    let start = Instant::now();
+    } else {
+        None
+    };
+
+    let started = Instant::now();
+    let mut issues: Vec<String> = Vec::new();
     let mut queues = Vec::new();
+
     for source in cfg.sources.iter().filter(|s| s.enabled) {
-        ensure!(source.destination.is_dir(), "{} destination missing: {}",
-            source.name, source.destination.display());
+        // Mount and local destination failures are global safety failures,
+        // unlike a provider listing or an individual partial.
+        ensure!(
+            source.destination.is_dir(),
+            "{} destination missing: {}",
+            source.name,
+            source.destination.display()
+        );
         no_symlink_ancestors(&source.destination)?;
-        let items = read_items(source).with_context(|| format!("listing {}", source.name))?;
+
+        let items = match read_items(source) {
+            Ok(items) => items,
+            Err(error) => {
+                let message = format!("{}: listing failed: {error:#}", source.name);
+                eprintln!("SOURCE FAILED: {message}");
+                issues.push(message);
+                continue;
+            }
+        };
         let mut files = Vec::new();
         for item in items {
             let target = source.destination.join(safe_relative(&item.path)?);
             no_symlink_ancestors(&target)?;
-            if target.exists() { continue; }
-            let (cp, _, _) = checkpoint(&cfg.archive_root, &source.name, &item, false)?;
-            files.push((cp.committed == 0, item));
+            if target.exists() {
+                continue;
+            }
+            match checkpoint(&cfg.archive_root, &source.name, &item, false) {
+                Ok((cp, _, _)) => files.push((cp.committed == 0, item)),
+                Err(error) => {
+                    let message = format!(
+                        "{}: checkpoint held for {}: {error:#}",
+                        source.name, item.path
+                    );
+                    eprintln!("ITEM HELD: {message}");
+                    issues.push(message);
+                }
+            }
         }
         files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.path.cmp(&b.1.path)));
         println!("{}: {} pending item(s)", source.name, files.len());
-        queues.push(Pending { source: source.clone(),
-            files: files.into_iter().map(|(_, x)| x).collect(), index: 0 });
+        queues.push(Pending {
+            source: source.clone(),
+            files: files.into_iter().map(|(_, item)| item).collect(),
+            index: 0,
+            failed: false,
+        });
     }
+
     if !execute {
         println!("PREVIEW ONLY: no files downloaded. Use run --execute when ready.");
+        if !issues.is_empty() {
+            bail!("{} source/item issue(s); other sources were still inspected", issues.len());
+        }
         return Ok(());
     }
+
     let rotation_path = state_root.join("rotation.json");
     let mut rotation: Rotation = if rotation_path.exists() {
         serde_json::from_slice(&fs::read(&rotation_path)?)?
-    } else { Rotation::default() };
+    } else {
+        Rotation::default()
+    };
     let mut budget = cfg.scheduler.budget_mib * 1024 * 1024;
     let chunk_limit = cfg.scheduler.chunk_mib * 1024 * 1024;
     let time_limit = Duration::from_secs(cfg.scheduler.run_seconds);
     let count = queues.len();
     if count == 0 {
+        if !issues.is_empty() {
+            bail!("All source listings failed ({} issue(s))", issues.len());
+        }
         println!("No sources enabled. Nothing downloaded.");
         return Ok(());
     }
+
     let first = rotation.next % count;
-    // Advance start source even when a later transfer fails.
     rotation.next = (first + 1) % count;
     atomic_json(&rotation_path, &rotation)?;
-    while budget > 0 && start.elapsed() < time_limit {
+
+    while budget > 0 && started.elapsed() < time_limit {
         let mut any = false;
         for i in 0..count {
-            if budget == 0 { break; }
+            if budget == 0 || time_limit.saturating_sub(started.elapsed()) < Duration::from_secs(8) {
+                break;
+            }
             let pending = &mut queues[(first + i) % count];
-            if pending.index >= pending.files.len() { continue; }
-            let item = &pending.files[pending.index];
-            let target = pending.source.destination.join(safe_relative(&item.path)?);
-            if target.exists() {
-                pending.index += 1;
-                any = true;
-                continue;
+            match advance_source(cfg, pending, &mut budget, chunk_limit, started, time_limit) {
+                Ok(progress) => any |= progress,
+                Err(error) => {
+                    let item = pending
+                        .files
+                        .get(pending.index)
+                        .map_or("<unknown>", |item| item.path.as_str());
+                    let message = format!(
+                        "{}: download held for {}: {error:#}",
+                        pending.source.name, item
+                    );
+                    eprintln!("SOURCE FAILED: {message}");
+                    pending.failed = true; // Do not retry the same failure this pass.
+                    issues.push(message);
+                    any = true; // Continue with other sources.
+                }
             }
-            let remaining = time_limit.saturating_sub(start.elapsed());
-            if remaining < Duration::from_secs(8) { break; }
-            let (mut cp, part, meta) = checkpoint(&cfg.archive_root,
-                &pending.source.name, item, true)?;
-            if cp.committed == item.size {
-                publish(&part, &meta, &pending.source.destination, &item.path, item.size)?;
-                pending.index += 1;
-                any = true;
-                continue;
-            }
-            let seconds = remaining.as_secs().saturating_sub(4);
-            let time_budget = cfg.scheduler.bandwidth_kib * 1024 * seconds;
-            let n = budget.min(chunk_limit).min(item.size - cp.committed).min(time_budget);
-            if n == 0 { break; }
-            // Account for attempted bytes before invoking any external or network client.
-            budget -= n;
-            let folder = part.parent().context("missing staged directory")?;
-            let chunk = NamedTempFile::new_in(folder)?;
-            println!("CHUNK {} {} @{} +{}", pending.source.name, item.path, cp.committed, n);
-            download_range(&pending.source, item, cp.committed, n, cfg.scheduler.bandwidth_kib,
-                remaining.saturating_sub(Duration::from_secs(2)), chunk.path())?;
-            store_chunk(&part, &meta, &mut cp, chunk.path())?;
-            if cp.committed == item.size {
-                publish(&part, &meta, &pending.source.destination, &item.path, item.size)?;
-                pending.index += 1;
-            }
-            any = true;
         }
-        if !any { break; }
+        if !any {
+            break;
+        }
     }
-    println!("PASS DONE: {} bytes of payload budget unused.", budget);
+    println!("PASS DONE: {budget} bytes of payload budget unused.");
+    if !issues.is_empty() {
+        bail!(
+            "{} source/item issue(s); completed work from healthy sources has been preserved",
+            issues.len()
+        );
+    }
     Ok(())
 }
 

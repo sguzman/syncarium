@@ -69,3 +69,72 @@ destination = "{}"
     assert!(another.status.success());
     assert_eq!(fs::read(dest.join("large.bin")).unwrap(), payload);
 }
+
+
+#[test]
+fn failed_cloud_source_does_not_starve_a_healthy_source() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("healthy-remote");
+    let root = temp.path().join("archive");
+    let healthy_destination = root.join("healthy");
+    let broken_destination = root.join("broken");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&healthy_destination).unwrap();
+    fs::create_dir_all(&broken_destination).unwrap();
+    fs::write(source.join("survives.txt"), b"independent source").unwrap();
+
+    let config = temp.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "expired-icloud"
+kind = "rclone"
+enabled = true
+remote = "syncarium-missing-unconfigured-remote:"
+destination = "{}"
+
+[[sources]]
+name = "healthy-google"
+kind = "rclone"
+enabled = true
+remote = ":local:{}"
+destination = "{}"
+"#,
+            root.display(),
+            broken_destination.display(),
+            source.display(),
+            healthy_destination.display()
+        ),
+    )
+    .unwrap();
+
+    let executable = env!("CARGO_BIN_EXE_syncarium");
+    let output = Command::new(executable)
+        .arg("--config")
+        .arg(&config)
+        .args(["run", "--execute"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "source failures must not be reported as total success"
+    );
+    assert_eq!(
+        fs::read(healthy_destination.join("survives.txt")).unwrap(),
+        b"independent source"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("listing failed"),
+        "the failed provider should be identified"
+    );
+}

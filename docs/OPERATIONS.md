@@ -29,7 +29,7 @@ Stopping a running service during a chunk can leave an uncommitted tail. The che
 
 ## Authentication expiration
 
-If Apple asks for 2FA again, refresh the relevant rclone remote from an interactive terminal. Syncarium must never store Apple credentials in its public TOML or logs. Do not attempt unattended password entry. A failed source listing terminates a pass and **does not erase** local content.
+If Apple asks for 2FA again, refresh the relevant rclone remote from an interactive terminal. Syncarium must never store Apple credentials in its public TOML or logs. Do not attempt unattended password entry. A failed source listing is reported and skipped for that pass, while other healthy sources can continue. The overall run returns a **nonzero** exit status if any source fails, and no local content is erased.
 
 ## A transfer refuses to run
 
@@ -46,3 +46,7 @@ The configured byte budget applies to **all Syncarium sources combined**, but th
 ## Documentation / data hygiene
 
 Never paste `rclone config show`, personal image listings, 2FA codes or local TOML containing credentials into GitHub. Persist downloaded content under `/drive`; code-only artifacts go to the repository. Logs can contain **source paths** and should be handled as potentially private.
+
+## Partial success is not total success
+
+A pass may report `SOURCE FAILED` or `ITEM HELD` and still commit completed chunks from other sources. This is intentional: a temporary Apple authentication error must not block Google Drive. The process exits nonzero when any provider or checkpoint fails. Investigate the reported source and renew authentication or resolve its partial state; do not delete the working archive. A `PASS DONE` message with a nonzero exit status is **not** proof of full backup coverage.

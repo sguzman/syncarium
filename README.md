@@ -15,6 +15,7 @@ The core scheduler, transfer logic, checkpointing, HTTP implementation, command-
 - One global **128 MiB payload allowance per run**; source listings and protocol overhead may use additional traffic.
 - One transfer at a time, **512 KiB/s** cap; **8 MiB chunks**, **15-minute** pass deadline, and systemd once per hour.
 - Weighted scheduling is **not yet implemented**; current code rotates starting sources each run and interleaves one chunk per source.
+- **Fault isolation:** an expired/failed source listing or an invalid individual checkpoint does not suppress healthy sources. The pass still reports failure (nonzero exit) if any source or file was held.
 - Preserve completed chunk data under **/drive/.syncarium/partials**, with a JSON checkpoint and last-chunk SHA-256 check.
 - Atomic publication of a completed file via a **no-clobber hard link**. Interrupted chunks do not replace completed chunks. Local destination files are immutable.
 - Source metadata/version changes halt resumption rather than silently stitching together two versions.

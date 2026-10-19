@@ -24,6 +24,7 @@ An adapter must provide (1) a complete list of source items and version/size, an
 6. Every attempted range decrements the single global **payload budget**. API listing overhead, HTTP headers, retried chunks, and authentication requests are outside the exact cap.
 7. Remote size or source-version changes cause the staged file to be held for inspection rather than silently concatenated. The version identifier is only as strong as the backend metadata.
 8. Global scheduling alternates sources after each chunk, rotating the first eligible source on each new run. Full weighted fairness is not yet available.
+9. Failure of one provider listing, source download, or partial-file checkpoint is isolated from other healthy sources. The pass exits nonzero if any failure occurred, while retaining completed downloads from other sources.
 
 ## Checkpoint protocol
 
