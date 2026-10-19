@@ -53,3 +53,7 @@ Never paste `rclone config show`, personal image listings, 2FA codes or local TO
 ## Partial success is not total success
 
 A pass may report `SOURCE FAILED` or `ITEM HELD` and still commit completed chunks from other sources. This is intentional: a temporary Apple authentication error must not block Google Drive. The process exits nonzero when any provider or checkpoint fails. Investigate the reported source and renew authentication or resolve its partial state; do not delete the working archive. A `PASS DONE` message with a nonzero exit status is **not** proof of full backup coverage.
+
+## Failed item handling
+
+When a file transfer or publication fails, that item's checkpoint is preserved and the scheduler proceeds to the next file in that same source. After **three consecutive file failures**, the source is paused for the remainder of that pass to avoid repeatedly hammering an expired or failing backend. A successful chunk or already-present file resets the streak. Failures still cause a **nonzero exit**, preserving honest monitoring; the next timer pass can retry the held paths.

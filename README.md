@@ -15,7 +15,7 @@ The core scheduler, transfer logic, checkpointing, HTTP implementation, command-
 - One global **128 MiB payload allowance per run**; source listings and protocol overhead may use additional traffic.
 - One transfer at a time, **512 KiB/s** cap; **8 MiB chunks**, **15-minute** pass deadline, and systemd once per hour.
 - Weighted scheduling is **not yet implemented**; current code rotates starting sources each run and interleaves one chunk per source.
-- **Fault isolation:** an expired/failed source listing or an invalid individual checkpoint does not suppress healthy sources. The pass still reports failure (nonzero exit) if any source or file was held.
+- **Fault isolation:** an expired/failed source listing or an invalid individual checkpoint does not suppress healthy sources. Individual failed transfers are held while other files proceed; a three-failure circuit breaker pauses repeatedly failing backends for the current pass. The pass still reports failure (nonzero exit) if any source or file was held.
 - Preserve completed chunk data under **/drive/.syncarium/partials**, with a JSON checkpoint and last-chunk SHA-256 check.
 - **Local progress inspection:** `syncarium status` and `syncarium status --json` report staged bytes and partial file counts without contacting cloud accounts.
 - **Read-only coverage audit:** `syncarium audit [--json]` compares provider listings with local files, separating missing, partial, present-size-matched, and conflicting files. It does not certify content integrity or provider listing completeness.

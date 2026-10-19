@@ -154,7 +154,18 @@ struct Pending {
     source: Source,
     files: Vec<Item>,
     index: usize,
-    failed: bool,
+    consecutive_failures: u8,
+    circuit_open: bool,
+}
+
+const MAX_CONSECUTIVE_ITEM_FAILURES: u8 = 3;
+
+fn hold_failed_item(queue: &mut Pending) {
+    queue.index = queue.index.saturating_add(1);
+    queue.consecutive_failures = queue.consecutive_failures.saturating_add(1);
+    if queue.consecutive_failures >= MAX_CONSECUTIVE_ITEM_FAILURES {
+        queue.circuit_open = true;
+    }
 }
 
 fn main() -> Result<()> {
@@ -717,7 +728,7 @@ fn advance_source(
     start: Instant,
     time_limit: Duration,
 ) -> Result<bool> {
-    if pending.index >= pending.files.len() || pending.failed {
+    if pending.index >= pending.files.len() || pending.circuit_open {
         return Ok(false);
     }
     let item = &pending.files[pending.index];
@@ -842,7 +853,8 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
             source: source.clone(),
             files: files.into_iter().map(|(_, item)| item).collect(),
             index: 0,
-            failed: false,
+            consecutive_failures: 0,
+            circuit_open: false,
         });
     }
 
@@ -884,7 +896,12 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
             }
             let pending = &mut queues[(first + i) % count];
             match advance_source(cfg, pending, &mut budget, chunk_limit, started, time_limit) {
-                Ok(progress) => any |= progress,
+                Ok(progress) => {
+                    if progress {
+                        pending.consecutive_failures = 0;
+                    }
+                    any |= progress;
+                }
                 Err(error) => {
                     let item = pending
                         .files
@@ -894,10 +911,19 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
                         "{}: download held for {}: {error:#}",
                         pending.source.name, item
                     );
-                    eprintln!("SOURCE FAILED: {message}");
-                    pending.failed = true; // Do not retry the same failure this pass.
+                    eprintln!("ITEM HELD: {message}");
                     issues.push(message);
-                    any = true; // Continue with other sources.
+                    // An individual broken file must not starve the rest of
+                    // its provider's archive. A brief failure streak opens
+                    // the provider's circuit to avoid flooding a broken API.
+                    hold_failed_item(pending);
+                    if pending.circuit_open {
+                        eprintln!(
+                            "SOURCE PAUSED: {} reached {} consecutive item failures",
+                            pending.source.name, MAX_CONSECUTIVE_ITEM_FAILURES
+                        );
+                    }
+                    any = true;
                 }
             }
         }
@@ -965,6 +991,38 @@ mod tests {
         publish(&part, &meta, &destination, &item).unwrap();
         assert_eq!(std::fs::read(destination.join("file.bin")).unwrap(), b"correct-data");
         assert!(!part.exists());
+    }
+
+    #[test]
+    fn item_failures_advance_queue_and_open_circuit_after_three() {
+        let source = Source {
+            name: "test".into(),
+            enabled: true,
+            destination: PathBuf::from("/tmp/test"),
+            backend: Backend::Rclone { remote: "none:".into() },
+        };
+        let mut pending = Pending {
+            source,
+            files: (0..5).map(|i| Item {
+                path: format!("item-{i}.bin"),
+                size: 1,
+                version: "v1".into(),
+                url: None,
+                sha256: None,
+            }).collect(),
+            index: 0,
+            consecutive_failures: 0,
+            circuit_open: false,
+        };
+        hold_failed_item(&mut pending);
+        assert_eq!(pending.index, 1);
+        assert!(!pending.circuit_open);
+        hold_failed_item(&mut pending);
+        assert_eq!(pending.index, 2);
+        assert!(!pending.circuit_open);
+        hold_failed_item(&mut pending);
+        assert_eq!(pending.index, 3);
+        assert!(pending.circuit_open);
     }
 
 }
