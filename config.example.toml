@@ -38,3 +38,17 @@ destination = "/drive/icloud/photos/primary"
 # enabled = false
 # manifest = "/home/USERNAME/.config/syncarium/http-manifest.json"
 # destination = "/drive/other-service"
+
+# Optional native Rust ID-addressed recovery of Google Drive duplicate files.
+# INACTIVE until enabled explicitly, and it requires a private, short-lived
+# Google OAuth bearer access token file with chmod 600.
+# This is a distinct, non-overlapping destination tree from the normal backup.
+# The same global run budget applies.
+#
+# [[sources]]
+# name = "google-drive-ids"
+# kind = "google_drive_ids"
+# enabled = false
+# remote = "gdrive:"
+# token_file = "/home/YOUR_USER/.config/syncarium/google-access-token"
+# destination = "/drive/gdrive/.id-recovery"

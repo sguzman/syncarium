@@ -129,3 +129,7 @@ If the service is stopped, or the machine is offline, the timer won't catch up a
 ### What stays out of GitHub
 
 Never commit `~/.config/rclone/rclone.conf`, your **local** `config.toml`, manifests with signed URLs, ``/drive` data, or `/drive/.syncarium`. Public documentation must not expose private filenames or album lists from your personal account.
+
+## Optional native Google ID recovery: credential requirements
+
+Do not enable this experimental adapter yet. For native ID-addressed Google blob transfers, Syncarium requires a local Google OAuth **access token** with Drive content read scope. Store only the short-lived token text in `~/.config/syncarium/google-access-token` and `chmod 600` the file. The Rust reader never logs it, but the token expires and does not refresh automatically. The program **does not import your rclone token, create OAuth clients, or force a new sign-in**. Obtaining a suitable token by an approved local method is a remaining setup dependency; do not paste a token into ChatGPT, GitHub, or a shell history command. Use the disabled TOML example from `config.example.toml` after live tests have been planned. This recovery destination must not overlap with any other enabled source destination.

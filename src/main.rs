@@ -19,6 +19,7 @@ use tempfile::NamedTempFile;
 mod inventory;
 mod drive_collisions;
 mod drive_recovery;
+mod drive_id;
 
 #[derive(Parser)]
 #[command(about = "One-way, bandwidth-budgeted archival across independent sources")]
@@ -97,6 +98,8 @@ struct Source {
 enum Backend {
     Rclone { remote: String },
     HttpManifest { manifest: PathBuf },
+    /// Immutable Google IDs, native Rust ranged REST reads; disabled by default.
+    GoogleDriveIds { remote: String, token_file: PathBuf },
 }
 #[derive(Clone, Debug)]
 struct Item {
@@ -105,6 +108,8 @@ struct Item {
     version: String,
     url: Option<String>,
     sha256: Option<String>,
+    object_id: Option<String>,
+    md5: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Checkpoint {
@@ -118,6 +123,8 @@ struct Checkpoint {
     last_sha256: String,
     #[serde(default)]
     expected_sha256: Option<String>,
+    #[serde(default)]
+    expected_md5: Option<String>,
 }
 #[derive(Deserialize)]
 struct HttpEntry {
@@ -556,6 +563,12 @@ fn validate(cfg: &Config) -> Result<()> {
             Backend::Rclone { remote } =>
                 ensure!(!remote.is_empty() && remote.contains(':') && !remote.contains('\n'),
                     "{} needs an rclone remote:path", s.name),
+            Backend::GoogleDriveIds { remote, token_file } => {
+                ensure!(!remote.is_empty() && remote.contains(':') && !remote.contains('\n'),
+                    "{} needs a Google rclone remote", s.name);
+                ensure!(token_file.is_absolute(), "{} needs absolute token_file", s.name);
+                clean_path(token_file)?;
+            }
             Backend::HttpManifest { manifest } =>
                 ensure!(manifest.is_absolute(), "{} manifest path must be absolute", s.name),
         }
@@ -644,7 +657,7 @@ fn checkpoint(root: &Path, source: &str, item: &Item, create: bool)
         let cp = Checkpoint { source: source.into(), path: item.path.clone(),
             size: item.size, version: item.version.clone(), committed: 0,
             last_offset: 0, last_size: 0, last_sha256: String::new(),
-            expected_sha256: item.sha256.clone() };
+            expected_sha256: item.sha256.clone(), expected_md5: item.md5.clone() };
         if create {
             fs::create_dir_all(part.parent().context("no parent")?)?;
             OpenOptions::new().write(true).create_new(true).open(&part)?;
@@ -655,7 +668,7 @@ fn checkpoint(root: &Path, source: &str, item: &Item, create: bool)
     let cp: Checkpoint = serde_json::from_slice(&fs::read(&meta)?)?;
     ensure!(cp.source == source && cp.path == item.path
         && cp.size == item.size && cp.version == item.version
-        && cp.expected_sha256 == item.sha256,
+        && cp.expected_sha256 == item.sha256 && cp.expected_md5 == item.md5,
         "source changed during staged download: {}; preserved for review", item.path);
     ensure!(cp.committed <= item.size, "invalid stored byte offset");
     let actual = fs::metadata(&part)?.len();
@@ -701,16 +714,47 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Vec<Item>> {
                     "modtime":value.get("ModTime"), "id":value.get("ID"),
                     "hashes":value.get("Hashes")
                 }))?;
-                items.push(Item { path: path.into(), size, version, url: None, sha256: None });
+                items.push(Item { path: path.into(), size, version, url: None,
+                    sha256: None, object_id: None, md5: None });
             }
             items
+        }
+        Backend::GoogleDriveIds { remote, .. } => {
+            // Metadata-only enumeration through the already authorized rclone
+            // remote. Payloads are then read natively over Google Drive REST.
+            let mut cmd = Command::new("rclone");
+            cmd.args(["backend", "query", remote, "trashed = false"]);
+            let raw = command_output_with_timeout(&mut cmd, listing_timeout)?;
+            ensure!(raw.len() <= 256 * 1024 * 1024,
+                "Google Drive ID listing exceeds 256 MiB limit");
+            let plan = drive_recovery::plan_recovery_json(&raw)?;
+            if plan.unknown_size > 0 || plan.unsupported > 0 {
+                eprintln!(
+                    "{}: {} size-unknown objects and {} unsupported objects require separate recovery",
+                    source.name, plan.unknown_size, plan.unsupported
+                );
+            }
+            plan.items.into_iter().filter_map(|item| {
+                // A native byte-range reader needs exact size and a source
+                // checksum. Google Docs exports do not provide either.
+                match (item.source_size, item.md5) {
+                    (Some(size), Some(md5)) =>
+                        Some(Item {
+                            path: item.relative_destination, size,
+                            version: item.version, url: None, sha256: None,
+                            object_id: Some(item.object_id), md5: Some(md5),
+                        }),
+                    _ => None,
+                }
+            }).collect()
         }
         Backend::HttpManifest { manifest } => {
             no_symlink_ancestors(manifest)?;
             let entries: Vec<HttpEntry> = serde_json::from_slice(&fs::read(manifest)?)?;
             entries.into_iter().map(|e| Item {
                 path:e.path, size:e.size, version:e.version, url: Some(e.url),
-                sha256:e.sha256.map(|hash| hash.to_ascii_lowercase())
+                sha256:e.sha256.map(|hash| hash.to_ascii_lowercase()),
+                object_id: None, md5: None
             }).collect()
         }
     };
@@ -726,6 +770,10 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Vec<Item>> {
         if let Some(hash) = &item.sha256 {
             ensure!(hash.len() == 64 && hash.bytes().all(|ch| ch.is_ascii_hexdigit()),
                 "invalid SHA-256 fingerprint for {}", item.path);
+        }
+        if let Some(md5) = &item.md5 {
+            ensure!(md5.len() == 32 && md5.bytes().all(|ch| ch.is_ascii_hexdigit()),
+                "invalid MD5 for {}", item.path);
         }
     }
     items.sort_by(|a, b| a.path.cmp(&b.path));
@@ -752,6 +800,12 @@ fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Resu
 fn download_range(source: &Source, item: &Item, offset: u64, count: u64,
     rate_kib: u64, deadline: Duration, staging: &Path) -> Result<()> {
     match &source.backend {
+        Backend::GoogleDriveIds { token_file, .. } => {
+            drive_id::read_range(
+                token_file, item.object_id.as_deref().context("missing Google immutable ID")?,
+                offset, count, item.size, rate_kib, deadline, staging
+            )?;
+        }
         Backend::Rclone { remote } => {
             let path = format!("{}/{}", remote.trim_end_matches('/'), item.path);
             let mut cmd = Command::new("rclone");
@@ -834,6 +888,22 @@ fn publish(part: &Path, meta: &Path, destination: &Path, item: &Item) -> Result<
         fs::metadata(part)?.len() == item.size,
         "cannot publish incomplete file"
     );
+    if let Some(expected) = &item.md5 {
+        use md5::Md5;
+        let mut reader = File::open(part)?;
+        let mut hasher = Md5::new();
+        let mut buffer = [0u8; 256 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 { break; }
+            hasher.update(&buffer[..read]);
+        }
+        ensure!(
+            hex::encode(hasher.finalize()) == *expected,
+            "Google Drive whole-file MD5 mismatch for {}; preserving partial",
+            item.path
+        );
+    }
     if let Some(expected) = &item.sha256 {
         let mut reader = File::open(part)?;
         let mut hasher = Sha256::new();
@@ -1140,7 +1210,7 @@ mod tests {
     fn new_checkpoints_do_not_limit_file_size() {
         let tmp = tempfile::tempdir().unwrap();
         let item = Item { path: "large.mp4".into(), size: 10_000_000_000,
-            version: "v1".into(), url: None, sha256: None };
+            version: "v1".into(), url: None, sha256: None, object_id: None, md5: None, object_id: None, md5: None };
         let (cp, part, _) = checkpoint(tmp.path(), "photos", &item, false).unwrap();
         assert_eq!(cp.committed, 0);
         assert!(!part.exists());
@@ -1168,6 +1238,8 @@ mod tests {
             version: "v1".into(),
             url: None,
             sha256: Some(hex::encode(Sha256::digest(b"different-data"))),
+            object_id: None,
+            md5: None,
         };
         assert!(publish(&part, &meta, &destination, &item).is_err());
         assert!(!destination.join("file.bin").exists());
@@ -1194,6 +1266,8 @@ mod tests {
                 version: "v1".into(),
                 url: None,
                 sha256: None,
+                object_id: None,
+                md5: None,
             }).collect(),
             index: 0,
             consecutive_failures: 0,

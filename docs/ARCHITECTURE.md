@@ -80,3 +80,7 @@ The read-only `drive-recovery-plan` CLI selects ambiguous Google file objects by
 ## HTTPS range exactness
 
 Native HTTP adapter requests explicitly bounded byte ranges and requires a `206 Partial Content` response whose `Content-Range` exactly matches **both the requested start/end and the original source's declared total size**. HTTP redirects are disabled to prevent unexpected endpoint changes or loss of source identity between chunks. Range mismatches are rejected before staging bytes are committed, preserving existing checkpoints. HTTPS manifests must point directly to range-capable final asset URLs.
+
+## Opt-in native Google blob ID downloads
+
+The experimental `google_drive_ids` adapter calls Google's file content GET endpoint by immutable ID with `alt=media` and a bounded `Range` header, using Rust HTTPS. Google object IDs and provider MD5/size/version metadata come from a read-only rclone `backend query` listing; access tokens come only from an owner-private local token file. Only known-size, provider-MD5-backed binary collision candidates are transferred. Google Docs exports and absent checksums are excluded, not silently claimed complete. Publication checks the **entire local file MD5** against the provider hash before atomic no-clobber linking. Network transfers share the scheduler's single global byte and time limits and its cross-run checkpoints. The token is short-lived and not renewed yet; Google's real endpoint and cross-version consistency still require end-to-end live QA.
