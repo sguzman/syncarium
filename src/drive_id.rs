@@ -77,16 +77,34 @@ pub(crate) fn read_range(
 ) -> Result<()> {
     ensure!(length > 0 && rate_kib > 0 && deadline > Duration::ZERO,
         "invalid transfer budget");
+    let token = read_token(token_file)?;
+    transfer_range(&token, google_url(object_id)?, offset, length, total,
+        rate_kib, deadline, staging)
+}
+
+/// Internal transport primitive, shared by the production Google URL and
+/// a local HTTP test server. Never logs bearer tokens or writes final files.
+fn transfer_range(
+    token: &str,
+    url: Url,
+    offset: u64,
+    length: u64,
+    total: u64,
+    rate_kib: u64,
+    deadline: Duration,
+    staging: &Path,
+) -> Result<()> {
+    ensure!(length > 0 && rate_kib > 0 && deadline > Duration::ZERO,
+        "invalid transfer budget");
     let end = offset.checked_add(length).and_then(|v| v.checked_sub(1))
         .context("invalid byte range")?;
     ensure!(end < total, "byte range exceeds object metadata size");
-    let token = read_token(token_file)?;
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(deadline)
         .build()?;
-    let mut response = client.get(google_url(object_id)?)
-        .bearer_auth(&token)
+    let mut response = client.get(url)
+        .bearer_auth(token)
         .header(RANGE, format!("bytes={offset}-{end}"))
         .send().context("Google Drive range request failed")?;
     if response.status().as_u16() != 206 {
@@ -174,6 +192,69 @@ mod tests {
         symlink(&actual, &redirect).unwrap();
         assert!(read_token(&redirect.join("token")).is_err());
         assert_eq!(read_token(&secret).unwrap(), "token-content");
+    }
+
+    /// Exercise real streaming and header checks using an isolated local HTTP
+    /// responder. These tests never contact Google or read actual user tokens.
+    #[test]
+    fn native_http_byte_ranges_are_authenticated_and_exact() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        fn scenario(status: &str, content_range: &str, body: &'static [u8])
+            -> (String, Vec<u8>, String)
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let status_line = status.to_owned();
+            let range_header = content_range.to_owned();
+            let (tx, rx) = mpsc::sync_channel::<String>(1);
+            let server = thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                let mut bytes = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut bytes).unwrap();
+                    if n == 0 { break; }
+                    request.extend_from_slice(&bytes[..n]);
+                    assert!(request.len() < 16 * 1024);
+                }
+                tx.send(String::from_utf8_lossy(&request).to_ascii_lowercase()).unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Range: {range_header}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).unwrap();
+                socket.write_all(body).unwrap();
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let staging = dir.path().join("chunk");
+            File::create(&staging).unwrap();
+            let success = transfer_range(
+                "fake-test-token",
+                Url::parse(&format!("http://{address}/file")).unwrap(),
+                2, 3, 10, 10240, Duration::from_secs(5), &staging
+            );
+            let request = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            server.join().unwrap();
+            (format!("{success:?}"), fs::read(&staging).unwrap(), request)
+        }
+
+        let (ok, data, req) = scenario("206 Partial Content", "bytes 2-4/10", b"cde");
+        assert!(ok.starts_with("Ok("), "{ok}");
+        assert_eq!(data, b"cde");
+        assert!(req.contains("range: bytes=2-4"));
+        assert!(req.contains("authorization: bearer fake-test-token"));
+
+        let (bad, data, _) = scenario("206 Partial Content", "bytes 2-4/11", b"cde");
+        assert!(bad.starts_with("Err("));
+        assert!(data.is_empty(), "incorrect total must never be staged");
+
+        let (redirect, data, _) = scenario("302 Found", "bytes 2-4/10", b"cde");
+        assert!(redirect.starts_with("Err("));
+        assert!(data.is_empty(), "redirects must not be followed or committed");
     }
 
 }
