@@ -24,6 +24,7 @@ mod drive_workspace;
 mod provider_probe;
 mod photos_inventory;
 mod photos_compare;
+mod photos_headers;
 mod receipts;
 
 #[derive(Parser)]
@@ -79,6 +80,20 @@ enum Action {
         /// Whether the reference describes remote files or an existing local archive.
         #[arg(long, value_enum, default_value = "provider")]
         reference_kind: photos_compare::ReferenceKind,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Locally inspect a bounded sample of archived media file signatures.
+    /// No cloud calls; requires --execute to read archive headers.
+    PhotosHeaders {
+        #[arg(long)]
+        source: String,
+        #[arg(long)]
+        fixture: PathBuf,
+        #[arg(long, default_value_t = 128)]
+        max_files: usize,
+        #[arg(long)]
+        execute: bool,
         #[arg(long)]
         json: bool,
     },
@@ -314,6 +329,8 @@ fn main() -> Result<()> {
             photos_inventory::inspect(&cfg, &source, fixture.as_deref(), execute, json)?,
         Action::PhotosCompare { source, reference, candidate, reference_kind, json } =>
             photos_compare::compare(&cfg, &source, &reference, &candidate, reference_kind, json)?,
+        Action::PhotosHeaders { source, fixture, max_files, execute, json } =>
+            photos_headers::run(&cfg, &source, &fixture, max_files, execute, json)?,
         Action::DriveCollisions { remote, json } => {
             check_mount(&cfg)?;
             drive_collisions(&remote, json)?;
