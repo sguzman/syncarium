@@ -20,6 +20,7 @@ mod inventory;
 mod drive_collisions;
 mod drive_recovery;
 mod drive_id;
+mod drive_workspace;
 mod receipts;
 
 #[derive(Parser)]
@@ -38,6 +39,18 @@ enum Action {
     Plan,
     /// Default is preview; --execute is required to download.
     Run { #[arg(long)] execute: bool },
+    /// Inventory Google Workspace exports and identify unsupported native types.
+    /// This is metadata-only; it never downloads export content.
+    DriveWorkspacePlan {
+        /// Configured Google Drive source name.
+        #[arg(long, default_value = "google-drive")]
+        source: String,
+        /// Read a private local provider inventory JSON fixture instead.
+        #[arg(long)]
+        fixture: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Plan immutable-ID recovery locations without downloading payload.
     DriveRecoveryPlan {
         /// Configured Google Drive source name.
@@ -243,8 +256,62 @@ fn main() -> Result<()> {
         Action::DriveRecoveryPlan { source, fixture, json } => {
             drive_recovery_plan(&cfg, &source, fixture.as_deref(), json)?;
         },
+        Action::DriveWorkspacePlan { source, fixture, json } => {
+            drive_workspace_plan(&cfg, &source, fixture.as_deref(), json)?;
+        },
         Action::Plan => transfer_pass(&cfg, false)?,
         Action::Run { execute } => transfer_pass(&cfg, execute)?,
+    }
+    Ok(())
+}
+
+/// Metadata-only Workspace export readiness inspection. Neither rclone copyid
+/// nor Google's export API is called from this command.
+fn drive_workspace_plan(
+    cfg: &Config,
+    source_name: &str,
+    fixture: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    check_mount(cfg)?;
+    let source = cfg.sources.iter()
+        .find(|src| src.name == source_name)
+        .with_context(|| format!("Google Drive source '{source_name}' not configured"))?;
+    let remote = match &source.backend {
+        Backend::Rclone { remote } | Backend::GoogleDriveIds { remote, .. } => remote.as_str(),
+        Backend::HttpManifest { .. } => bail!("Workspace planning requires Google Drive source"),
+    };
+    ensure!(source.destination.is_dir(), "archive destination must exist");
+    no_symlink_ancestors(&source.destination)?;
+    let raw = if let Some(path) = fixture {
+        ensure!(path.is_absolute(), "fixture path must be absolute");
+        no_symlink_ancestors(path)?;
+        fs::read(path).context("reading local private Workspace fixture")?
+    } else {
+        ensure!(remote.contains(':') && !remote.starts_with('-')
+            && !remote.chars().any(char::is_control), "invalid Google remote");
+        let mut command = Command::new("rclone");
+        command.args(["backend", "query", remote, "trashed = false"]);
+        command_output_with_timeout(&mut command, Duration::from_secs(180))
+            .context("read-only Google Workspace inventory query failed")?
+    };
+    ensure!(raw.len() <= 256 * 1024 * 1024, "Workspace inventory exceeds 256 MiB cap");
+    let plan = drive_workspace::plan(&raw)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        println!("Read-only Workspace export readiness for {source_name}");
+        println!("{} supported export candidates (size unknown until export)",
+            plan.supported.len());
+        println!("{} Google-native objects need different handling",
+            plan.unsupported_google_types);
+        println!("{} non-Workspace/folder/shortcut objects ignored by this planner",
+            plan.ignored_non_workspace);
+        println!("No export downloads and no archive modifications.");
+    }
+    if plan.unsupported_google_types > 0 {
+        bail!("Workspace export coverage incomplete: {} unsupported Google-native objects",
+            plan.unsupported_google_types);
     }
     Ok(())
 }

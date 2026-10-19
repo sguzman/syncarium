@@ -97,3 +97,5 @@ Other already-authorized sources can continue within the same bandwidth budget. 
 - **Local SHA-256 receipts:** each newly published file has an immutable receipt recording exactly which local bytes were assembled. `syncarium verify [--source NAME] [--json]` rehashes those files without contacting cloud accounts; preexisting files without receipts are explicitly outside this verification.
 
 - **Interrupted publication reconciliation:** a restarted executing pass can clean stale staging links from an already completed file only after confirming same-file inode identity, completed checkpoint, and matching receipt. Different-file conflicts are preserved.
+
+- **Workspace export readiness:** `drive-workspace-plan [--json]` maps Google Docs/Sheets/Slides/Drawings to DOCX/XLSX/PPTX/SVG without exposing private names or downloading data. A Rust small-export HTTP primitive enforces strict size/type limits but is intentionally not scheduled until budget and source-version guarantees are established. Unsupported Google-native documents remain visible as coverage gaps.

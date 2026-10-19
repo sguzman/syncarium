@@ -30,7 +30,7 @@ fn google_url(id: &str) -> Result<Url> {
 
 /// A short-lived access token is an explicit local operator dependency.
 /// Do not log its contents or accept permissive file permissions.
-fn read_token(path: &Path) -> Result<String> {
+pub(crate) fn read_token(path: &Path) -> Result<String> {
     ensure!(path.is_absolute(), "Google access token file must be an absolute path");
     for ancestor in path.ancestors() {
         if ancestor.is_symlink() {
