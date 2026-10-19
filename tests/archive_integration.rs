@@ -861,3 +861,65 @@ destination = "{}"
         .output().unwrap();
     assert!(checked.status.success());
 }
+
+
+#[test]
+fn photo_inventory_cli_uses_private_fixture_without_cloud_or_archive_writes() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("archive");
+    let dest = root.join("photos");
+    fs::create_dir_all(&dest).unwrap();
+    let config = temp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "photos"
+kind = "rclone"
+enabled = false
+remote = "this-account-is-not-configured:"
+destination = "{}"
+"#, root.display(), dest.display())).unwrap();
+    let fixture = temp.path().join("private-photo-list.json");
+    fs::write(&fixture, serde_json::to_vec(&serde_json::json!([
+        {"Path":"family/IMG_101.HEIC","Size":4000,"ModTime":"2026-10-01","ID":"secret-cloud-id-1"},
+        {"Path":"family/IMG_101.MOV","Size":5000,"ModTime":"2026-10-01","ID":"secret-cloud-id-2"},
+        {"Path":"family/IMG_102.jpg","Size":3000},
+        {"Path":"family/IMG_102.AAE","Size":100}
+    ])).unwrap()).unwrap();
+
+    let execute = |args: &[&str]| Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config).args(args).output().unwrap();
+    let preview = execute(&["photos-inventory", "--source", "photos"]);
+    assert!(preview.status.success());
+    assert!(String::from_utf8_lossy(&preview.stdout).contains("PREVIEW ONLY"));
+
+    let report = Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config)
+        .args(["photos-inventory", "--source", "photos", "--fixture"])
+        .arg(&fixture).arg("--json")
+        .output().unwrap();
+    assert!(report.status.success(), "{}",
+        String::from_utf8_lossy(&report.stderr));
+    let summary: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(summary["listed_files"], 4);
+    assert_eq!(summary["possible_still_motion_pairs"], 1);
+    assert_eq!(summary["still_images"], 2);
+    assert_eq!(summary["motion_files"], 1);
+    assert_eq!(summary["sidecars"], 1);
+    assert_eq!(summary["missing_provider_id"], 2);
+    let output = String::from_utf8_lossy(&report.stdout);
+    for secret in ["IMG_101", "IMG_102", "secret-cloud-id", "family/"] {
+        assert!(!output.contains(secret));
+    }
+    assert!(!root.join(".syncarium").exists(),
+        "diagnostic must not create checkpoints, ledgers, or receipts");
+    assert!(!dest.join("family").exists(),
+        "diagnostic must not create archive media paths");
+}
