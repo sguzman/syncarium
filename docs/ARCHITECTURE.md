@@ -68,3 +68,7 @@ The overall `run_seconds` deadline starts **before** provider listing, not after
 ## Append-only source observation ledger
 
 Successful **executing** passes keep source-path SHA-256 fingerprints under `/drive/.syncarium/inventories/<source>.json`. They are derived from the source name and remote relative path; filenames and credentials are not stored in the ledger. Newly observed paths extend the set. Previously observed but currently missing paths remain recorded, trigger a coverage warning and make the overall pass return nonzero. No source or local files are deleted. Dry-run `plan` and `audit` only read this ledger. A first listing is a **provisional baseline**, not proof of full cloud coverage; upstream APIs may omit unseen photos or duplicate Google Drive objects. Path renames look like a disappearance plus an addition until resolved manually. Do not treat an absent source item as authorization to delete its local archive.
+
+## Google Drive path collisions
+
+The `drive-collisions` command compares immutable Drive object IDs for siblings that map to the same output filename, considering common Google-native Docs export extensions. It also walks descendants of same-named folders. A path-based rclone listing alone cannot prove these objects are present. The command is explicit and read-only; no automatic ID-based recovery is claimed.

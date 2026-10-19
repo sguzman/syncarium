@@ -56,3 +56,7 @@ Put manifests with signed/private URLs in `~/.config/syncarium/` with `chmod 600
 This interface is currently conceptual; the implementation uses one Rust enum to dispatch adapters. Future backend refactors must maintain current checkpoint safety semantics.
 
 Candidates: OpenDAL-based Google Drive, WebDAV, SFTP, custom download APIs, and future iCloud-specific Rust libraries. Do not accept a backend merely because it can list filenames; correctness of unique identities, variants and range integrity matters.
+
+## Google Drive collision audit
+
+The optional `drive-collisions --remote gdrive:` command uses the read-only `rclone backend query gdrive: 'trashed = false'` API and analyzes stable object IDs, parent IDs and names in Rust. It reports aggregate counts, including duplicate folder descendants invisible to a path-based listing. No personal object names are printed. This is not duplicate **recovery**: the Rust engine will need an ID-addressed downloader and provenance sidecars before it can replace the legacy Google recovery job. Query coverage and configured Docs export formats can affect results.

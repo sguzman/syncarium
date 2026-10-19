@@ -64,3 +64,7 @@ The current rclone backend uses **paths**, not provider-native immutable object 
 New features should improve coverage without weakening download-only, no-delete, no-overwrite, or mount safety.
 
 License: MIT.
+
+### Google Drive immutable-ID diagnostic
+
+Run `syncarium --config ~/.config/syncarium/config.toml drive-collisions --remote gdrive: --json` to inspect Google Drive object IDs for duplicate sibling names, Google Docs export-name collisions and files obscured by duplicate-named folders. This is metadata-only, can consume API requests, and has a 180-second query timeout. It **does not** yet download these duplicate objects. It returns nonzero when collisions are detected.

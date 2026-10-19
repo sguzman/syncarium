@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
 mod inventory;
+mod drive_collisions;
 
 #[derive(Parser)]
 #[command(about = "One-way, bandwidth-budgeted archival across independent sources")]
@@ -34,6 +35,13 @@ enum Action {
     Plan,
     /// Default is preview; --execute is required to download.
     Run { #[arg(long)] execute: bool },
+    /// Read-only Google Drive immutable-ID duplicate name inspection.
+    DriveCollisions {
+        #[arg(long, default_value = "gdrive:")]
+        remote: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Audit source-to-local coverage (metadata listing; no file payload downloads).
     Audit {
         /// Print machine-readable JSON.
@@ -189,8 +197,41 @@ fn main() -> Result<()> {
         }
         Action::Status { json } => status(&cfg, json)?,
         Action::Audit { json } => audit(&cfg, json)?,
+        Action::DriveCollisions { remote, json } => {
+            check_mount(&cfg)?;
+            drive_collisions(&remote, json)?;
+        },
         Action::Plan => transfer_pass(&cfg, false)?,
         Action::Run { execute } => transfer_pass(&cfg, execute)?,
+    }
+    Ok(())
+}
+
+/// Explicit identity inspection: contacts the Google metadata API, not file bytes.
+fn drive_collisions(remote: &str, json: bool) -> Result<()> {
+    ensure!(
+        remote.contains(':') && !remote.starts_with('-') && !remote.chars().any(char::is_control),
+        "remote must be a Google Drive rclone remote"
+    );
+    let mut command = Command::new("rclone");
+    command.args(["backend", "query", remote, "trashed = false"]);
+    let raw = command_output_with_timeout(&mut command, Duration::from_secs(180))
+        .context("Google Drive object ID query failed")?;
+    ensure!(raw.len() <= 256 * 1024 * 1024, "Google object listing too large to audit");
+    let counts = drive_collisions::summarize_json(&raw)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&counts)?);
+    } else {
+        println!("Google Drive object identity audit: {remote}");
+        println!("Objects: {}", counts.objects);
+        println!("Duplicate file groups: {} ({} objects)", counts.file_groups, counts.file_objects);
+        println!("Duplicate folder groups: {} ({} objects)", counts.folder_groups, counts.folder_objects);
+        println!("Hidden descendant files under duplicate folders: {}", counts.hidden_descendant_files);
+        println!("File versus folder output-name collisions: {}", counts.cross_type_groups);
+        println!("Read-only analysis; nothing was downloaded or modified.");
+    }
+    if counts.has_collisions() {
+        bail!("Google Drive contains ID-level name collisions requiring recovery");
     }
     Ok(())
 }

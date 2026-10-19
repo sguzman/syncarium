@@ -65,3 +65,7 @@ The configured `run_seconds` includes cloud enumeration. When one provider takes
 ## Detecting missing cloud items over time
 
 Once `run --execute` completes a valid source inventory listing, Syncarium keeps an append-only history of path fingerprints in `/drive/.syncarium/inventories`. A later listing missing any previously observed path reports `COVERAGE WARNING`, even if the cloud provider returns an apparently successful response. `audit --json` exposes `historical_absent` and `historical_ever_seen`. This is a cautious warning: intentional cloud deletion or rename can also cause it. Source deletions **never remove local files or past observation records**. The initial observation ledger does not guarantee all Apple Photos or duplicate Google Drive objects were ever visible.
+
+## Google Drive identity audit
+
+Use `syncarium --config ~/.config/syncarium/config.toml drive-collisions --remote gdrive: --json` to inspect duplicate filenames/folders from provider object metadata. It may use considerable API listing bandwidth but does not download file contents or change either archive. It fails with a nonzero status on duplicates, empty response or query error. This is a diagnostic; keep the legacy Google duplicate-recovery tool until Syncarium implements equivalent recovery.
