@@ -60,7 +60,7 @@ fn snapshot(path: &Path, name: &str) -> Result<Vec<Item>> {
 
 /// Remote metadata comparisons are intentionally ignored when the reference
 /// lists local files: local inode IDs and mtimes aren't Google/Apple asset IDs.
-fn provider_field<'a>(item: &'a Item, field: &str) -> Result<Option<String>> {
+fn provider_field(item: &Item, field: &str) -> Result<Option<String>> {
     let parsed: Value = serde_json::from_str(&item.version)
         .context("invalid provider metadata in comparison inventory")?;
     Ok(parsed.get(field)
