@@ -60,3 +60,7 @@ Native Rust HTTP is implemented. Apache OpenDAL has a Rust Google Drive service,
 ## Read-only coverage audit
 
 The `audit` subcommand inventories every enabled source and compares path and file **size** without transferring payload. It reports present-size-matched, local conflicts, staged, missing, and inaccessible/held items separately. Counts reflect only what the source adapter lists, which can be incomplete (especially Apple Photos). Matching size is **not** proof of matching bytes or successful original-quality export. Results can be obtained as structured JSON for future UIs; the audit never deletes or repairs content.
+
+## Time budget and source enumeration
+
+The overall `run_seconds` deadline starts **before** provider listing, not after it. Each rclone inventory query is capped by the lesser of 180 seconds or the remaining pass time. An unlisted source is postponed and reported as an issue if the pass is out of time. This avoids a long list of slow cloud sources silently extending a supposedly bounded hourly pass. The process still has normal filesystem and process-shutdown overhead; the systemd service is an additional upper bound.

@@ -212,7 +212,7 @@ fn audit(cfg: &Config, json: bool) -> Result<()> {
             name: source.name.clone(),
             ..AuditSource::default()
         };
-        match read_items(source) {
+        match read_items(source, Duration::from_secs(180)) {
             Err(error) => {
                 row.error = Some(format!("{error:#}"));
                 errors += 1;
@@ -538,13 +538,13 @@ fn checkpoint(root: &Path, source: &str, item: &Item, create: bool)
     }
     Ok((cp, part, meta))
 }
-fn read_items(source: &Source) -> Result<Vec<Item>> {
+fn read_items(source: &Source, listing_timeout: Duration) -> Result<Vec<Item>> {
     let mut items = match &source.backend {
         Backend::Rclone { remote } => {
             let mut command = Command::new("rclone");
             command.args(["lsjson", remote, "--recursive", "--files-only",
                 "--checkers", "1", "--tpslimit", "2"]);
-            let output = command_output_with_timeout(&mut command, Duration::from_secs(180))?;
+            let output = command_output_with_timeout(&mut command, listing_timeout)?;
             let values: Vec<serde_json::Value> = serde_json::from_slice(&output)?;
             let mut items = Vec::new();
             for value in values {
@@ -819,7 +819,18 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
         );
         no_symlink_ancestors(&source.destination)?;
 
-        let items = match read_items(source) {
+        let remaining = Duration::from_secs(cfg.scheduler.run_seconds)
+            .saturating_sub(started.elapsed());
+        if remaining < Duration::from_secs(2) {
+            let message = format!(
+                "{}: pass deadline reached before remote listing; postponed",
+                source.name
+            );
+            eprintln!("SOURCE POSTPONED: {message}");
+            issues.push(message);
+            continue;
+        }
+        let items = match read_items(source, remaining.min(Duration::from_secs(180))) {
             Ok(items) => items,
             Err(error) => {
                 let message = format!("{}: listing failed: {error:#}", source.name);

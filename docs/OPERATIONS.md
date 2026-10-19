@@ -57,3 +57,7 @@ A pass may report `SOURCE FAILED` or `ITEM HELD` and still commit completed chun
 ## Failed item handling
 
 When a file transfer or publication fails, that item's checkpoint is preserved and the scheduler proceeds to the next file in that same source. After **three consecutive file failures**, the source is paused for the remainder of that pass to avoid repeatedly hammering an expired or failing backend. A successful chunk or already-present file resets the streak. Failures still cause a **nonzero exit**, preserving honest monitoring; the next timer pass can retry the held paths.
+
+## Listings consume the run deadline
+
+The configured `run_seconds` includes cloud enumeration. When one provider takes too long to list its files, Syncarium limits that listing to the remaining time and reports sources it could not process. This is deliberate: it never starts a late download beyond the user's allotted window. Enabling multiple sources requires considering their inventory latency as well as transfer speed.
