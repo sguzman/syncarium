@@ -8,7 +8,17 @@ The core scheduler, transfer logic, checkpointing, HTTP implementation, command-
 
 ## Status
 
-**v0.1 prototype: NOT READY FOR UNATTENDED PRODUCTION USE.** A source-aware scheduler and durable byte-range downloader are implemented, with initial tests. End-to-end behavior with the rclone iCloud Photos backend and duplicate Google Drive objects has not been validated; data-completeness audits are still outstanding. No timers are enabled or started by repository changes.
+**v0.1 Rust transfers pass offline tests; real cloud transfer QA on the authorized Linux host is still required for unattended use.** A source-aware scheduler and durable byte-range downloader are implemented, with initial tests. End-to-end behavior with the rclone iCloud Photos backend and duplicate Google Drive objects has not been validated; data-completeness audits are still outstanding. No timers are enabled or started by repository changes.
+
+## First real Syncarium download
+
+The next step is a real cloud-to-archive run, not more diagnostics. From a checkout of this repository, run:
+
+    bash scripts/first-live-sync.sh icloud-drive
+
+Repeat with icloud-photos and google-drive once the first source works. The script checks the mounted ext4 archive, rclone remote and matching legacy service, builds Rust, and downloads missing files from exactly one source using a private temporary config. It limits accepted payload to 4 MiB at 512 KiB/s with one-MiB chunks and a five-minute scheduler. Provider metadata and internal network traffic may exceed 4 MiB. It never disables or modifies legacy services or installs a timer. It DOES perform a real download and may create append-only files or checkpoints in the existing archive. It uses existing rclone credentials only; no new OAuth application or login server.
+
+The source-selecting CLI arguments are plan --source NAME and run --source NAME --execute. Google-native objects with unknown size now register incomplete coverage but do not block downloads of known-size binary files. The run may exit nonzero after making valid partial progress. Existing source data, archives and services are not deleted.
 
 ## Current architecture
 

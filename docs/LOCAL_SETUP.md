@@ -1,5 +1,9 @@
 # Local installation and initial setup (EndeavourOS / Hyprland)
 
+## One controlled live download first
+
+To test actual syncing rather than just offline diagnostics, run bash scripts/first-live-sync.sh icloud-drive from this checkout. The script uses existing rclone authorization and local archive destinations, one source per invocation. It checks the external ext4 mount and matching legacy service, builds the current Rust binary, then downloads with a 4 MiB accepted payload cap, 512 KiB/s, and 5-minute scheduler. It does not alter existing config files or enable timers; it DOES write accepted media chunks and new completed archive files. Repeat the same command with icloud-photos and google-drive after reviewing real results. The existing remote listing may take longer or incur extra network traffic. A provider with missing Google-native size information can exit nonzero while known-size transfers still succeed.
+
 This guide intentionally separates **repository preparation**, **cloud authentication**, **dry-run verification**, and **enabling recurring downloads**. Nothing should become autonomous until its source listing and a small transfer have been verified locally.
 
 ## 0. Checklist
