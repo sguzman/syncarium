@@ -49,3 +49,7 @@ Identical listings are **not** sufficient evidence of original-quality exports, 
 ## Whole-file verification versus provider completeness
 
 The offline `photos-checksums` diagnostic reads full local media bytes within explicit file and byte limits and checks them against a separately supplied reference digest. It is useful when reliable expected SHA-256 values are available; it cannot extract authoritative Apple original hashes from provider listings that never supplied them. A successful hash comparison proves local/reference byte equality and nothing about unseen assets, missing Live Photo companions, or edited versions. No live provider access or automatic cloud-token management is required.
+
+## Explicit original Live Photo relationship evidence
+
+A provider file listing is insufficient to establish which MOV component belongs to a specific Live Photo source asset. The offline `photos-asset-evidence` command can compare a separately acquired **explicit resource-to-asset-ID manifest** against those listed media paths, without interpreting shared filenames as conclusive. Apple's original `pairedVideo` and rendered/edited `fullSizePairedVideo` are deliberately distinct in the normalized schema. There is no independent Apple-source evidence collector implemented today, and no new Apple authentication or Mac dependency is planned as a prerequisite. See [ASSET_EVIDENCE](ASSET_EVIDENCE.md).
