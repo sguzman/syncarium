@@ -1078,12 +1078,21 @@ fn parse_rclone_inventory_inner(
     Ok((items, unresolved))
 }
 
+// Avoid a serial, artificially rate-limited full traversal of large cloud trees.
+// rclone handles provider throttling and retries; no names or metadata are logged.
+fn rclone_listing_command(remote: &str) -> Command {
+    let mut command = Command::new("rclone");
+    command.args([
+        "lsjson", remote, "--recursive", "--files-only",
+        "--no-mimetype", "--checkers", "4",
+    ]);
+    command
+}
+
 fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
     let (mut items, exports, unresolved) = match &source.backend {
         Backend::Rclone { remote } => {
-            let mut command = Command::new("rclone");
-            command.args(["lsjson", remote, "--recursive", "--files-only",
-                "--checkers", "1", "--tpslimit", "2"]);
+            let mut command = rclone_listing_command(remote);
             let output = command_output_with_timeout(&mut command, listing_timeout)?;
             let (items, unresolved) =
                 parse_rclone_inventory_inner(&output, &source.name, true)?;
@@ -1160,6 +1169,27 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
 // filesystem. In particular, iCloud Photos can enumerate very large albums.
 // This ceiling bounds BOTH temporary disk consumption and JSON allocation.
 const MAX_PROVIDER_LISTING_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PROVIDER_STDERR_BYTES: u64 = 128 * 1024;
+
+// Provider diagnostics may contain remote paths, identifiers, or credentials.
+// Only print a coarse classification, never raw provider stderr.
+fn provider_failure_hint(raw: &[u8]) -> &'static str {
+    let message = String::from_utf8_lossy(raw).to_ascii_lowercase();
+    if ["unauthorized", "invalid_grant", "authentication", "not authenticated",
+        "token expired", "trust token", "2fa", "missing pcs cookies", "reconnect"]
+        .iter().any(|term| message.contains(term)) {
+        "possible authentication/approval failure"
+    } else if ["rate limit", "too many requests", "429"]
+        .iter().any(|term| message.contains(term)) {
+        "provider rate limiting"
+    } else if ["network", "connection reset", "i/o timeout", "tls handshake",
+        "context deadline exceeded"]
+        .iter().any(|term| message.contains(term)) {
+        "possible network/transport failure"
+    } else {
+        "no recognizable provider error category"
+    }
+}
 
 fn command_output_with_timeout(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
     command_output_with_limit(command, timeout, MAX_PROVIDER_LISTING_BYTES)
@@ -1173,9 +1203,12 @@ fn command_output_with_limit(
     ensure!(max_bytes > 0, "provider listing byte limit must be positive");
     ensure!(timeout > Duration::ZERO, "provider command requires nonzero deadline");
     let stdout = NamedTempFile::new()?;
-    command.stdout(Stdio::from(stdout.reopen()?)).stderr(Stdio::null());
+    let stderr = NamedTempFile::new()?;
+    command.stdout(Stdio::from(stdout.reopen()?))
+        .stderr(Stdio::from(stderr.reopen()?));
     let mut child = command.spawn().context("starting external provider backend")?;
     let start = Instant::now();
+    let mut last_progress = Instant::now();
     loop {
         // Inspect the actual output file on every poll, including AFTER the
         // subprocess terminates. Never load oversized JSON into Rust memory.
@@ -1184,8 +1217,16 @@ fn command_output_with_limit(
             child.wait().ok();
             bail!("provider inventory exceeded {max_bytes} byte output limit; refusing incomplete listing");
         }
+        if stderr.as_file().metadata()?.len() > MAX_PROVIDER_STDERR_BYTES {
+            child.kill().ok();
+            child.wait().ok();
+            bail!("provider diagnostic output exceeded its safe limit; refusing incomplete listing");
+        }
         if let Some(status) = child.try_wait()? {
-            ensure!(status.success(), "provider command failed (status {status})");
+            if !status.success() {
+                let hint = provider_failure_hint(&fs::read(stderr.path())?);
+                bail!("provider command failed (status {status}; {hint}; raw diagnostics withheld)");
+            }
             // A final check covers races between metadata sampling and exit.
             ensure!(stdout.as_file().metadata()?.len() <= max_bytes,
                 "provider inventory exceeded {max_bytes} byte output limit");
@@ -1194,7 +1235,14 @@ fn command_output_with_limit(
         if start.elapsed() >= timeout {
             child.kill().ok();
             child.wait().ok();
-            bail!("provider command exceeded {}s timeout", timeout.as_secs());
+            let hint = provider_failure_hint(&fs::read(stderr.path())?);
+            bail!("provider command exceeded {}s timeout ({hint}; raw diagnostics withheld)",
+                timeout.as_secs());
+        }
+        if last_progress.elapsed() >= Duration::from_secs(30) {
+            eprintln!("PROVIDER LISTING: {}s elapsed, {} bytes of metadata buffered",
+                start.elapsed().as_secs(), stdout.as_file().metadata()?.len());
+            last_progress = Instant::now();
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -1710,6 +1758,13 @@ fn advance_source(
     Ok(true)
 }
 
+// Preserve time for the actual transfer, rather than spending the entire pass
+// enumerating remote metadata. Large listings may use up to ten minutes.
+fn listing_budget(remaining: Duration) -> Duration {
+    remaining.saturating_sub(Duration::from_secs(30))
+        .min(Duration::from_secs(600))
+}
+
 fn transfer_pass(cfg: &Config, execute: bool, selected_source: Option<&str>) -> Result<()> {
     if let Some(name) = selected_source {
         ensure!(cfg.sources.iter().any(|src| src.name == name && src.enabled),
@@ -1762,7 +1817,7 @@ fn transfer_pass(cfg: &Config, execute: bool, selected_source: Option<&str>) -> 
             issues.push(message);
             continue;
         }
-        let listing = match read_items(source, remaining.min(Duration::from_secs(180))) {
+        let listing = match read_items(source, listing_budget(remaining)) {
             Ok(listing) => listing,
             Err(error) => {
                 let message = format!("{}: listing failed: {error:#}", source.name);
@@ -2396,6 +2451,36 @@ mod tests {
         assert!(enforce_listing_floor(&source, 2, 9_999).is_err());
         assert!(enforce_listing_floor(&source, 2, 10_000).is_ok());
         assert!(enforce_listing_floor(&source, 1, 100_000).is_err());
+    }
+
+    #[test]
+    fn rclone_listing_avoids_serial_provider_throttle() {
+        let command = rclone_listing_command("icloud:");
+        let args: Vec<_> = command.get_args()
+            .map(|value| value.to_string_lossy().into_owned()).collect();
+        assert!(args.contains(&"--recursive".to_string()));
+        assert!(args.contains(&"--no-mimetype".to_string()));
+        assert!(!args.contains(&"--tpslimit".to_string()));
+        assert!(args.windows(2).any(|pair| pair == ["--checkers", "4"]));
+    }
+
+    #[test]
+    fn listing_budget_preserves_time_for_payload_downloads() {
+        assert_eq!(listing_budget(Duration::from_secs(900)),
+            Duration::from_secs(600));
+        assert_eq!(listing_budget(Duration::from_secs(300)),
+            Duration::from_secs(270));
+        assert_eq!(listing_budget(Duration::from_secs(20)), Duration::ZERO);
+    }
+
+    #[test]
+    fn provider_error_categories_never_expose_stderr() {
+        assert_eq!(provider_failure_hint(b"401 unauthorized token=private"),
+            "possible authentication/approval failure");
+        assert_eq!(provider_failure_hint(b"429 too many requests"),
+            "provider rate limiting");
+        assert_eq!(provider_failure_hint(b"error for private/path"),
+            "no recognizable provider error category");
     }
 
     #[cfg(unix)]
