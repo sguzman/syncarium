@@ -80,7 +80,7 @@ required_mount = "/drive"
 budget_mib = 4
 chunk_mib = 1
 bandwidth_kib = 512
-run_seconds = 300
+run_seconds = 900
 
 [[sources]]
 name = "$source_name"
@@ -95,7 +95,7 @@ cargo build --release --manifest-path "$repo_root/Cargo.toml"
 binary="$repo_root/target/release/syncarium"
 "$binary" --config "$config" doctor
 printf 'REAL SYNC START: %s -> %s\n' "$remote" "$destination"
-echo 'LIMIT: one pass, 4 MiB accepted cloud payload, 512 KiB/s, 5-minute scheduler. Provider internal traffic and metadata are extra.'
+echo 'LIMIT: one pass, 4 MiB accepted cloud payload, 512 KiB/s, 15-minute scheduler. Provider internal traffic and metadata are extra.'
 echo 'LEGACY: services/timers unchanged; this job does not install or enable a timer.'
 "$binary" --config "$config" run --source "$source_name" --execute
 echo 'REAL SYNC PASS COMPLETED. Any newly published files are under the existing archive destination.'
