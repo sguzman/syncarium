@@ -108,7 +108,7 @@ fn hash_existing_file(target: &Path, expected_size: u64) -> Result<String> {
     let mut left = expected_size;
     let mut buffer = [0u8; BUFFER_SIZE];
     while left > 0 {
-        let limit = buffer.len().min(left as usize);
+        let limit = left.min(BUFFER_SIZE as u64) as usize;
         let n = file.read(&mut buffer[..limit])?;
         ensure!(n > 0, "archive media ended during SHA-256 verification");
         sha.update(&buffer[..n]);
@@ -280,22 +280,23 @@ mod tests {
     #[test]
     fn byte_and_file_limits_hold_even_for_large_expected_files() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("small.heic"), b"first").unwrap();
-        fs::write(tmp.path().join("other.heic"), b"second").unwrap();
+        fs::write(tmp.path().join("a-small.heic"), b"first").unwrap();
+        fs::write(tmp.path().join("c-other.heic"), b"second").unwrap();
         let input = serde_json::json!([
-            entry("small.heic", 5, b"first"),
-            entry("other.heic", 6, b"second"),
-            entry("huge.heic", 1024 * 1024, b"irrelevant")
+            entry("a-small.heic", 5, b"first"),
+            entry("b-too-large.heic", 20, b"not-a-real-file"),
+            entry("c-other.heic", 6, b"second"),
+            entry("d-after.heic", 3, b"last")
         ]);
         let bytes = serde_json::to_vec(&input).unwrap();
-        let report = inspect(tmp.path(), "photos", &bytes, 2, 10).unwrap();
-        assert_eq!(report.matched_sha256, 1);
+        let report = inspect(tmp.path(), "photos", &bytes, 2, 12).unwrap();
+        assert_eq!(report.matched_sha256, 2);
         assert_eq!(report.deferred_byte_budget, 1);
         assert_eq!(report.deferred_file_limit, 1);
-        assert_eq!(report.disk_bytes_reserved, 5);
-        let valid = inspect(tmp.path(), "photos", &bytes, 1, 1).unwrap();
+        assert_eq!(report.disk_bytes_reserved, 11);
+        let valid = inspect(tmp.path(), "photos", &bytes, 1, 1024 * 1024).unwrap();
         assert_eq!(valid.matched_sha256, 1);
-        assert_eq!(valid.deferred_file_limit, 2);
+        assert_eq!(valid.deferred_file_limit, 3);
     }
 
     #[test]
