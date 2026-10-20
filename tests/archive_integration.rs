@@ -1147,3 +1147,124 @@ destination = "{}"
     assert_eq!(fs::read(&private_outside).unwrap(), b"\xff\xd8\xff\xe0");
     assert!(!root.join(".syncarium").exists());
 }
+
+
+#[test]
+fn photos_checksums_cli_detects_same_size_corruption_without_cloud_or_archive_changes() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("archive");
+    let dest = root.join("photos");
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(dest.join("archive-a.heic"), b"abc").unwrap();
+    fs::write(dest.join("archive-b.mov"), b"xyz").unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "photos"
+enabled = false
+kind = "rclone"
+remote = "not-configured:"
+destination = "{}"
+"#, root.display(), dest.display())).unwrap();
+    let digest_abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let manifest = tmp.path().join("private-reference.json");
+    fs::write(&manifest, serde_json::to_vec(&serde_json::json!([
+        {"path":"archive-a.heic","size":3,"sha256":digest_abc},
+        {"path":"archive-b.mov","size":3,"sha256":digest_abc}
+    ])).unwrap()).unwrap();
+
+    let run = |execute: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_syncarium"));
+        cmd.arg("--config").arg(&config)
+            .args(["photos-checksums", "--source", "photos", "--reference"])
+            .arg(&manifest)
+            .args(["--max-files", "2", "--max-mib", "1", "--json"]);
+        if execute { cmd.arg("--execute"); }
+        cmd.output().unwrap()
+    };
+    let preview = run(false);
+    assert!(preview.status.success());
+    assert!(String::from_utf8_lossy(&preview.stdout).contains("PREVIEW ONLY"));
+    assert!(!root.join(".syncarium").exists());
+
+    let mismatch = run(true);
+    assert!(!mismatch.status.success(), "a same-size corruption must fail");
+    let output: serde_json::Value = serde_json::from_slice(&mismatch.stdout).unwrap();
+    assert_eq!(output["matched_sha256"], 1);
+    assert_eq!(output["mismatched_sha256"], 1);
+    assert_eq!(output["checked_files"], 2);
+    assert_eq!(output["disk_bytes_reserved"], 6);
+    assert_eq!(output["max_disk_bytes"], 1024 * 1024);
+    for private in ["archive-a.heic", "archive-b.mov", "private-reference"] {
+        assert!(!String::from_utf8_lossy(&mismatch.stdout).contains(private));
+    }
+    assert_eq!(fs::read(dest.join("archive-b.mov")).unwrap(), b"xyz",
+        "failed comparison must never modify mismatched media");
+
+    fs::write(dest.join("archive-b.mov"), b"abc").unwrap();
+    let restored = run(true);
+    assert!(restored.status.success(), "{}",
+        String::from_utf8_lossy(&restored.stderr));
+    let verified: serde_json::Value = serde_json::from_slice(&restored.stdout).unwrap();
+    assert_eq!(verified["matched_sha256"], 2);
+    assert_eq!(verified["mismatched_sha256"], 0);
+    assert!(!root.join(".syncarium").exists(),
+        "local comparison must not create archive receipts or checkpoints");
+}
+
+#[cfg(unix)]
+#[test]
+fn photos_checksums_cli_rejects_symlinks_and_missing_hash_evidence() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("archive");
+    let dest = root.join("photos");
+    fs::create_dir_all(&dest).unwrap();
+    let other = tmp.path().join("outside");
+    fs::write(&other, b"abc").unwrap();
+    symlink(&other, dest.join("link.heic")).unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "photos"
+enabled = false
+kind = "rclone"
+remote = "not-configured:"
+destination = "{}"
+"#, root.display(), dest.display())).unwrap();
+    let fixture = tmp.path().join("ref.json");
+    let sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    fs::write(&fixture, serde_json::to_vec(&serde_json::json!([
+        {"path":"link.heic","size":3,"sha256":sha},
+        {"path":"unverified.heic","size":3}
+    ])).unwrap()).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config)
+        .args(["photos-checksums", "--source", "photos", "--reference"])
+        .arg(&fixture)
+        .args(["--max-files", "2", "--max-mib", "1", "--execute", "--json"])
+        .output().unwrap();
+    assert!(!result.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["unsafe_or_unreadable"], 1);
+    assert_eq!(report["missing_reference_checksums"], 1);
+    assert_eq!(report["matched_sha256"], 0);
+    assert_eq!(fs::read(&other).unwrap(), b"abc",
+        "symlink must not be followed or modified");
+}
