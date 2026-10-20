@@ -25,6 +25,7 @@ mod provider_probe;
 mod photos_inventory;
 mod photos_compare;
 mod photos_headers;
+mod photos_checksums;
 mod receipts;
 
 #[derive(Parser)]
@@ -92,6 +93,24 @@ enum Action {
         fixture: PathBuf,
         #[arg(long, default_value_t = 128)]
         max_files: usize,
+        #[arg(long)]
+        execute: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify local archive media against independently supplied SHA-256s.
+    /// Never contacts cloud sources; requires --execute to read file contents.
+    PhotosChecksums {
+        #[arg(long)]
+        source: String,
+        /// Private JSON array of path, size, and expected SHA-256.
+        #[arg(long)]
+        reference: PathBuf,
+        #[arg(long, default_value_t = 128)]
+        max_files: usize,
+        /// Cap local disk bytes read, not cloud traffic (default 256 MiB).
+        #[arg(long, default_value_t = 256)]
+        max_mib: u64,
         #[arg(long)]
         execute: bool,
         #[arg(long)]
@@ -331,6 +350,11 @@ fn main() -> Result<()> {
             photos_compare::compare(&cfg, &source, &reference, &candidate, reference_kind, json)?,
         Action::PhotosHeaders { source, fixture, max_files, execute, json } =>
             photos_headers::run(&cfg, &source, &fixture, max_files, execute, json)?,
+        Action::PhotosChecksums {
+            source, reference, max_files, max_mib, execute, json
+        } => photos_checksums::run(
+            &cfg, &source, &reference, max_files, max_mib, execute, json
+        )?,
         Action::DriveCollisions { remote, json } => {
             check_mount(&cfg)?;
             drive_collisions(&remote, json)?;
