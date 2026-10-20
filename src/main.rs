@@ -26,6 +26,7 @@ mod photos_inventory;
 mod photos_compare;
 mod photos_headers;
 mod photos_checksums;
+mod photos_asset_evidence;
 mod receipts;
 
 #[derive(Parser)]
@@ -113,6 +114,20 @@ enum Action {
         max_mib: u64,
         #[arg(long)]
         execute: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Offline Apple-style asset resource evidence comparison.
+    /// Requires an explicit asset/resource manifest; filenames alone are never paired.
+    PhotosAssetEvidence {
+        #[arg(long)]
+        source: String,
+        /// Private normalized per-asset resource evidence JSON.
+        #[arg(long)]
+        evidence: PathBuf,
+        /// Previously saved rclone lsjson file inventory.
+        #[arg(long)]
+        listing: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -355,6 +370,8 @@ fn main() -> Result<()> {
         } => photos_checksums::run(
             &cfg, &source, &reference, max_files, max_mib, execute, json
         )?,
+        Action::PhotosAssetEvidence { source, evidence, listing, json } =>
+            photos_asset_evidence::run(&cfg, &source, &evidence, &listing, json)?,
         Action::DriveCollisions { remote, json } => {
             check_mount(&cfg)?;
             drive_collisions(&remote, json)?;
