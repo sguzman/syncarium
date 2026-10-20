@@ -1029,34 +1029,53 @@ fn enforce_listing_floor(source: &Source, count: usize, total_bytes: u64) -> Res
 /// Parse rclone's complete lsjson response for both the normal scheduler
 /// and read-only photo diagnostics. Reject malformed or duplicate entries;
 /// neither path should turn a partial JSON array into a valid inventory.
+/// Strict parser for diagnostics: never treat unknown-size media as complete.
 fn parse_rclone_inventory(raw: &[u8], source_name: &str) -> Result<Vec<Item>> {
+    let (items, unresolved) = parse_rclone_inventory_inner(raw, source_name, false)?;
+    ensure!(unresolved == 0, "incomplete source inventory");
+    Ok(items)
+}
+
+/// Runtime parser can continue known-size downloads, but it reports every
+/// unknown-size object as unresolved, forcing a nonzero overall run status.
+fn parse_rclone_inventory_inner(
+    raw: &[u8],
+    source_name: &str,
+    allow_unknown_size: bool,
+) -> Result<(Vec<Item>, usize)> {
     let values: Vec<serde_json::Value> = serde_json::from_slice(raw)
         .context("invalid provider listing JSON")?;
     let mut items = Vec::with_capacity(values.len());
+    let mut unresolved = 0usize;
     let mut seen = HashSet::new();
     for value in values {
-        let (Some(path), Some(size)) = (
-            value.get("Path").and_then(|x| x.as_str()),
-            value.get("Size").and_then(|x| x.as_u64()),
-        ) else {
-            bail!("{source_name} returned a file without valid path and size; refusing incomplete inventory");
-        };
+        let path = value.get("Path").and_then(|x| x.as_str())
+            .context("provider file entry has no valid Path")?;
         ensure!(!path.is_empty(), "{source_name} returned empty file path");
         safe_relative(path)?;
         ensure!(seen.insert(path.to_string()),
-            "{source_name} listed a duplicate destination path; inventory requires identity-aware recovery");
-        // No original personal names are serialized into diagnostic reports.
+            "{source_name} listed a duplicate destination path; identity-aware recovery required");
+        let size_value = value.get("Size")
+            .context("provider file entry is missing Size; refusing incomplete inventory")?;
+        let size = if let Some(size) = size_value.as_u64() {
+            size
+        } else if allow_unknown_size && size_value.as_i64().is_some_and(|n| n < 0) {
+            unresolved += 1;
+            continue;
+        } else {
+            bail!("{source_name} returned an invalid or unknown file size; refusing incomplete inventory");
+        };
         let version = serde_json::to_string(&serde_json::json!({
             "modtime": value.get("ModTime"),
             "id": value.get("ID"),
             "hashes": value.get("Hashes"),
         }))?;
         items.push(Item {
-            path: path.to_string(), size, version,
-            url: None, sha256: None, object_id: None, md5: None,
+            path: path.to_string(), size, version, url: None,
+            sha256: None, object_id: None, md5: None,
         });
     }
-    Ok(items)
+    Ok((items, unresolved))
 }
 
 fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
@@ -1066,8 +1085,9 @@ fn read_items(source: &Source, listing_timeout: Duration) -> Result<Listing> {
             command.args(["lsjson", remote, "--recursive", "--files-only",
                 "--checkers", "1", "--tpslimit", "2"]);
             let output = command_output_with_timeout(&mut command, listing_timeout)?;
-            let items = parse_rclone_inventory(&output, &source.name)?;
-            (items, Vec::new(), 0)
+            let (items, unresolved) =
+                parse_rclone_inventory_inner(&output, &source.name, true)?;
+            (items, Vec::new(), unresolved)
         }
         Backend::GoogleDriveIds { remote, .. } => {
             // Metadata-only enumeration through the already authorized rclone
@@ -1753,7 +1773,7 @@ fn transfer_pass(cfg: &Config, execute: bool, selected_source: Option<&str>) -> 
         };
         if listing.unresolved > 0 {
             let message = format!(
-                "{}: {} Google Drive collision objects not eligible for verified ranged recovery; needs separate handling",
+                "{}: {} provider objects have unsupported/unknown-size metadata; known-size transfers can continue, but coverage remains incomplete",
                 source.name, listing.unresolved
             );
             eprintln!("SOURCE INCOMPLETE: {message}");
@@ -2499,6 +2519,32 @@ mod tests {
         atomic_json(&meta, &cp).unwrap();
         assert!(checkpoint(temp.path(), "photos", &item, true).is_err());
         assert_eq!(std::fs::read(&part).unwrap(), b"abcd");
+    }
+
+    #[test]
+    fn runtime_listing_preserves_known_size_files_when_google_docs_have_unknown_size() {
+        let fixture = br#"[
+            {"Path":"valid/photo.jpg","Size":4096,"ModTime":"2026-01-01"},
+            {"Path":"document.gdoc","Size":-1,"ID":"google-native-document"},
+            {"Path":"valid/archive.zip","Size":1000,"ID":"binary-file"}
+        ]"#;
+        assert!(parse_rclone_inventory(fixture, "gdrive").is_err(),
+            "strict diagnostic parsing must not accept incomplete inventory");
+        let (files, unresolved) =
+            parse_rclone_inventory_inner(fixture, "gdrive", true).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(unresolved, 1);
+        assert_eq!(files[0].path, "valid/photo.jpg");
+        assert_eq!(files[1].path, "valid/archive.zip");
+        let malformed = br#"[{"Path":"file.bin"},{"Path":"other.bin","Size":12}]"#;
+        assert!(parse_rclone_inventory_inner(malformed, "gdrive", true).is_err(),
+            "missing Size is malformed, not a normal unknown-size object");
+        let duplicates = br#"[
+            {"Path":"same.gdoc","Size":-1},
+            {"Path":"same.gdoc","Size":1024}
+        ]"#;
+        assert!(parse_rclone_inventory_inner(duplicates, "gdrive", true).is_err(),
+            "duplicate paths remain unsafe even when an object has unknown size");
     }
 
 }
