@@ -42,9 +42,19 @@ enum Action {
     /// Validate configuration and basic local prerequisites; no remote downloads.
     Doctor,
     /// Enumerate configured sources and show pending counts; no downloads.
-    Plan,
+    Plan {
+        /// Restrict a preview to one named, enabled source.
+        #[arg(long)]
+        source: Option<String>,
+    },
     /// Default is preview; --execute is required to download.
-    Run { #[arg(long)] execute: bool },
+    Run {
+        #[arg(long)]
+        execute: bool,
+        /// Run only this named, enabled source without editing private TOML.
+        #[arg(long)]
+        source: Option<String>,
+    },
     /// Validate provider byte-offset and count behavior without archiving data.
     /// Downloads 192 KiB only with explicit --execute.
     ProbeRange {
@@ -382,8 +392,9 @@ fn main() -> Result<()> {
         Action::DriveWorkspacePlan { source, fixture, json } => {
             drive_workspace_plan(&cfg, &source, fixture.as_deref(), json)?;
         },
-        Action::Plan => transfer_pass(&cfg, false)?,
-        Action::Run { execute } => transfer_pass(&cfg, execute)?,
+        Action::Plan { source } => transfer_pass(&cfg, false, source.as_deref())?,
+        Action::Run { execute, source } =>
+            transfer_pass(&cfg, execute, source.as_deref())?,
     }
     Ok(())
 }
@@ -1679,7 +1690,11 @@ fn advance_source(
     Ok(true)
 }
 
-fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
+fn transfer_pass(cfg: &Config, execute: bool, selected_source: Option<&str>) -> Result<()> {
+    if let Some(name) = selected_source {
+        ensure!(cfg.sources.iter().any(|src| src.name == name && src.enabled),
+            "selected source {name} not found or not enabled");
+    }
     check_mount(cfg)?;
     let state_root = cfg.archive_root.join(".syncarium");
     let _lock = if execute {
@@ -1703,7 +1718,9 @@ fn transfer_pass(cfg: &Config, execute: bool) -> Result<()> {
     let mut issues: Vec<String> = Vec::new();
     let mut queues = Vec::new();
 
-    for source in cfg.sources.iter().filter(|s| s.enabled) {
+    for source in cfg.sources.iter()
+        .filter(|s| s.enabled && selected_source.is_none_or(|name| s.name == name))
+    {
         // Mount and local destination failures are global safety failures,
         // unlike a provider listing or an individual partial.
         ensure!(
