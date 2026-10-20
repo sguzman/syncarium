@@ -1398,3 +1398,76 @@ destination = "{}"
     assert_eq!(report["live_assets_with_both_original_resources_listed"], 0);
     assert!(!root.exists());
 }
+
+
+#[test]
+fn source_selected_real_rclone_transfer_only_archives_requested_provider() {
+    let tmp = tempdir().unwrap();
+    let remotes = tmp.path().join("remote");
+    let google = remotes.join("g");
+    let apple = remotes.join("a");
+    let archive = tmp.path().join("archive");
+    let g_dest = archive.join("google");
+    let a_dest = archive.join("apple");
+    for dir in [&google, &apple, &g_dest, &a_dest] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::write(google.join("actual-drive-file.bin"), b"google-data").unwrap();
+    fs::write(apple.join("actual-photo.heic"), b"icloud-data").unwrap();
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "google-drive"
+kind = "rclone"
+enabled = true
+remote = ":local:{}"
+destination = "{}"
+
+[[sources]]
+name = "icloud-photos"
+kind = "rclone"
+enabled = true
+remote = ":local:{}"
+destination = "{}"
+"#, archive.display(), google.display(), g_dest.display(),
+            apple.display(), a_dest.display())).unwrap();
+
+    let command = |args: &[&str]| Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config).args(args).output().unwrap();
+    let preview = command(&["plan", "--source", "icloud-photos"]);
+    assert!(preview.status.success(), "{}",
+        String::from_utf8_lossy(&preview.stderr));
+    assert!(!g_dest.join("actual-drive-file.bin").exists());
+    assert!(!a_dest.join("actual-photo.heic").exists());
+
+    let first = command(&["run", "--source", "icloud-photos", "--execute"]);
+    assert!(first.status.success(), "{}",
+        String::from_utf8_lossy(&first.stderr));
+    assert_eq!(fs::read(a_dest.join("actual-photo.heic")).unwrap(), b"icloud-data");
+    assert!(!g_dest.join("actual-drive-file.bin").exists(),
+        "unselected source must not download anything");
+    assert!(command(&["verify", "--source", "icloud-photos", "--json"]).status.success());
+
+    let second = command(&["run", "--source", "google-drive", "--execute"]);
+    assert!(second.status.success(), "{}",
+        String::from_utf8_lossy(&second.stderr));
+    assert_eq!(fs::read(g_dest.join("actual-drive-file.bin")).unwrap(), b"google-data");
+    assert!(command(&["verify", "--source", "google-drive", "--json"]).status.success());
+
+    let invalid = command(&["run", "--source", "unknown-remote", "--execute"]);
+    assert!(!invalid.status.success(), "unknown source must fail closed");
+
+    let repeating = command(&["run", "--source", "google-drive", "--execute"]);
+    assert!(repeating.status.success(), "{}",
+        String::from_utf8_lossy(&repeating.stderr));
+    assert_eq!(fs::read(g_dest.join("actual-drive-file.bin")).unwrap(), b"google-data",
+        "repeated run must preserve the original archived file");
+}
