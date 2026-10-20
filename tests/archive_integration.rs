@@ -1268,3 +1268,133 @@ destination = "{}"
     assert_eq!(fs::read(&other).unwrap(), b"abc",
         "symlink must not be followed or modified");
 }
+
+
+#[test]
+fn photo_asset_evidence_cli_never_infers_live_photo_from_same_name() {
+    let tmp = tempdir().unwrap();
+    // Intentionally absent archive: this command must be 100% offline.
+    let root = tmp.path().join("archive-does-not-exist");
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "icloud-photos"
+kind = "rclone"
+enabled = false
+remote = "not-configured:"
+destination = "{}"
+"#, root.display(), root.join("photos").display())).unwrap();
+    let evidence = tmp.path().join("private-asset-resources.json");
+    let listing = tmp.path().join("private-rclone-listing.json");
+    let original = serde_json::json!({
+        "schema_version":1, "scope":"sample",
+        "assets":[{
+            "asset_id":"private-apple-resource-identifier",
+            "kind":"live_photo",
+            "resources":[
+                {"resource_type":"photo","path":"family/IMG_0001.HEIC","size":100},
+                {"resource_type":"paired_video","path":"family/IMG_0001.MOV","size":300}
+            ]
+        }]
+    });
+    fs::write(&evidence, serde_json::to_vec(&original).unwrap()).unwrap();
+    fs::write(&listing, serde_json::to_vec(&serde_json::json!([
+        {"Path":"family/IMG_0001.HEIC","Size":100,"ID":"rclone-id-a"},
+        {"Path":"family/IMG_0001.MOV","Size":300,"ID":"rclone-id-b"},
+        {"Path":"family/IMG_9999.MOV","Size":100}
+    ])).unwrap()).unwrap();
+    let compare = || Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config)
+        .args(["photos-asset-evidence", "--source", "icloud-photos", "--evidence"])
+        .arg(&evidence).arg("--listing").arg(&listing).arg("--json")
+        .output().unwrap();
+    let result = compare();
+    assert!(result.status.success(), "{}",
+        String::from_utf8_lossy(&result.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["declared_live_photo_assets"], 1);
+    assert_eq!(report["live_assets_with_both_original_resources_listed"], 1);
+    assert_eq!(report["listing_files_without_asset_mapping"], 1);
+    assert_eq!(report["apple_completeness_proven"], false);
+    for sensitive in ["IMG_0001", "IMG_9999", "private-apple-resource", "family/"] {
+        assert!(!String::from_utf8_lossy(&result.stdout).contains(sensitive));
+    }
+    assert!(!root.exists(), "offline comparison must never access or create archive");
+
+    let mut edited = original.clone();
+    edited["assets"][0]["resources"][1]["resource_type"] =
+        serde_json::json!("full_size_paired_video");
+    fs::write(&evidence, serde_json::to_vec(&edited).unwrap()).unwrap();
+    let only_edited = compare();
+    assert!(!only_edited.status.success(),
+        "rendered/edited companion alone is not original Live Photo evidence");
+    let report: serde_json::Value =
+        serde_json::from_slice(&only_edited.stdout).unwrap();
+    assert_eq!(report["live_assets_missing_original_paired_video_role"], 1);
+
+    edited["assets"][0]["resources"][1]["resource_type"] =
+        serde_json::json!("paired_video");
+    edited["scope"] = serde_json::json!("claimed_complete");
+    fs::write(&evidence, serde_json::to_vec(&edited).unwrap()).unwrap();
+    let incomplete = compare();
+    assert!(!incomplete.status.success(),
+        "claimed-complete evidence must not omit an enumerated cloud file");
+    let report: serde_json::Value =
+        serde_json::from_slice(&incomplete.stdout).unwrap();
+    assert_eq!(report["listing_files_without_asset_mapping"], 1);
+    assert!(!root.exists());
+}
+
+#[test]
+fn photo_asset_evidence_detects_missing_declared_companion_not_just_filename() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("not-created");
+    let config = tmp.path().join("config.toml");
+    fs::write(&config, format!(
+        r#"archive_root = "{}"
+
+[scheduler]
+budget_mib = 1
+chunk_mib = 1
+bandwidth_kib = 10240
+run_seconds = 120
+
+[[sources]]
+name = "photos"
+enabled = false
+kind = "rclone"
+remote = "not-configured:"
+destination = "{}"
+"#, root.display(), root.join("photos").display())).unwrap();
+    let evidence = tmp.path().join("evidence.json");
+    let listing = tmp.path().join("listing.json");
+    fs::write(&evidence, serde_json::to_vec(&serde_json::json!({
+        "schema_version":1,"scope":"sample",
+        "assets":[{"asset_id":"secret-asset","kind":"live_photo",
+            "resources":[
+                {"resource_type":"photo","path":"photo.heic","size":5},
+                {"resource_type":"paired_video","path":"paired.mov","size":10}
+            ]}]
+    })).unwrap()).unwrap();
+    // Filename heuristics would not know photo.heic and paired.mov are
+    // related. Explicit asset evidence demands both actual listed resources.
+    fs::write(&listing, br#"[{"Path":"photo.heic","Size":5}]"#).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_syncarium"))
+        .arg("--config").arg(&config)
+        .args(["photos-asset-evidence", "--source", "photos", "--evidence"])
+        .arg(&evidence).arg("--listing").arg(&listing).arg("--json")
+        .output().unwrap();
+    assert!(!result.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["resources_missing_from_listing"], 1);
+    assert_eq!(report["live_assets_with_both_original_resources_listed"], 0);
+    assert!(!root.exists());
+}
