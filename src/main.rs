@@ -1223,6 +1223,8 @@ fn command_output_with_limit(
             bail!("provider diagnostic output exceeded its safe limit; refusing incomplete listing");
         }
         if let Some(status) = child.try_wait()? {
+            ensure!(stderr.as_file().metadata()?.len() <= MAX_PROVIDER_STDERR_BYTES,
+                "provider diagnostic output exceeded its safe limit");
             if !status.success() {
                 let hint = provider_failure_hint(&fs::read(stderr.path())?);
                 bail!("provider command failed (status {status}; {hint}; raw diagnostics withheld)");
@@ -2461,7 +2463,8 @@ mod tests {
         assert!(args.contains(&"--recursive".to_string()));
         assert!(args.contains(&"--no-mimetype".to_string()));
         assert!(!args.contains(&"--tpslimit".to_string()));
-        assert!(args.windows(2).any(|pair| pair == ["--checkers", "4"]));
+        assert!(args.windows(2).any(|pair|
+            pair[0] == "--checkers" && pair[1] == "4"));
     }
 
     #[test]
@@ -2481,6 +2484,20 @@ mod tests {
             "provider rate limiting");
         assert_eq!(provider_failure_hint(b"error for private/path"),
             "no recognizable provider error category");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_stderr_is_classified_without_exposing_private_values() {
+        let mut failing = Command::new("sh");
+        failing.args(["-c", "echo '401 unauthorized private-token secret' >&2; exit 1"]);
+        let err = command_output_with_limit(
+            &mut failing, Duration::from_secs(5), 1024,
+        ).unwrap_err();
+        let display = format!("{err:#}");
+        assert!(display.contains("authentication/approval"));
+        assert!(!display.contains("private-token"));
+        assert!(!display.contains("secret"));
     }
 
     #[cfg(unix)]
